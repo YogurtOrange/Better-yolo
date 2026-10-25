@@ -1,0 +1,67 @@
+# ==================== 用户数据(勿提交) ====================
+
+# 项目数据库: 图片路径/标注/训练任务等全部元数据
+data/
+
+# 项目数据: 每个项目一个 <项目名>_<时间戳>/ 文件夹,
+# 内含导入的图片副本与AI标注内部文件(任务配置/断点/示例图)
+projects/
+
+# 训练输出: ultralytics 生成的 runs/train/exp_* 等
+runs/
+
+# 测试页推理输出(启动时自动清空的运行产物)
+outputs/
+
+# 导出/生成的训练数据集
+datasets/
+
+# YOLO/SAM 模型下载目录(应用按需自动下载到此处)
+pretrained/
+
+# ==================== 敏感配置(含密钥) ====================
+
+# AI标注API Key 与本地模型配置, 随用户使用生成, 勿提交
+config/*.json
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# ==================== 模型与推理产物 ====================
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+*.mlmodel
+results/
+
+# ==================== 日志与临时文件 ====================
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ==================== IDE / 系统文件 ====================
+.vscode/
+.idea/
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes

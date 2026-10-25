@@ -1,0 +1,34 @@
+# Runtime dependencies verified against the local conda environment: pytorch.
+# Python 3.10; install with: conda run -n pytorch python -m pip install -r requirements.txt
+# Only project dependencies are listed; pip resolves their transitive dependencies.
+
+# Desktop GUI and training charts
+PyQt6==6.11.0
+matplotlib==3.10.8
+
+# Image processing (NumPy 1.x matches the installed OpenCV 4.8 build)
+numpy==1.26.4
+opencv-python==4.8.1.78
+Pillow==12.3.0
+
+# YOLO training/inference and SAM/FastSAM annotation
+ultralytics==8.4.104
+# Local CUDA builds: torch 2.10.0+cu128, torchvision 0.25.0+cu128.
+# Install matching CUDA wheels first when recreating a GPU environment.
+# These public-version pins also accept the installed +cu128 builds.
+torch==2.10.0
+torchvision==0.25.0
+
+# Qwen-VL / OpenAI-compatible API client
+openai==3.5.0
+
+# ONNX export, simplification and inference
+onnx==1.21.0
+onnxslim==0.1.94
+# The current environment imports the GPU runtime (also supports CPU inference).
+# For CPU-only deployment, replace the following line with onnxruntime==1.23.2.
+# Install only one ONNX Runtime variant; both provide the onnxruntime module.
+onnxruntime-gpu==1.22.0
+
+# Optional: TensorRT export/inference requires a separately installed tensorrt
+# package matching the deployment CUDA environment; it is not installed locally.
