@@ -14,7 +14,7 @@ import json
 import shutil
 from typing import Dict, List, Optional
 
-from gui.styles import COLORS
+from gui.styles import COLORS, format_log_html
 from models.database import db
 
 # Matplotlib 导入
@@ -1726,10 +1726,10 @@ class TrainPage(QWidget):
         self.log_message(message)
     
     def log_message(self, message: str):
-        """添加日志"""
+        """添加日志(按内容语义着色)"""
         from datetime import datetime
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.append(f"[{timestamp}] {message}")
+        self.log_text.append(format_log_html(message, timestamp))
         
         # 自动滚动到底部
         scrollbar = self.log_text.verticalScrollBar()

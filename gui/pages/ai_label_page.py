@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QPixmap
 
-from gui.styles import COLORS
+from gui.styles import COLORS, format_log_html
 from models.database import db
 from core.qwen_annotator import (
     StopRequested,
@@ -1648,7 +1648,7 @@ class AiLabelPage(QWidget):
     # -------------------- 日志 --------------------
 
     def append_log(self, msg):
-        self.log_edit.append(str(msg))
+        self.log_edit.append(format_log_html(msg))
 
         # 同步滚动到底部
         sb = self.log_edit.verticalScrollBar()

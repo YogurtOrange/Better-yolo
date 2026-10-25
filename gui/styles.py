@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Shared colors and native Qt widget styles for the desktop workspace."""
 
+import html
+import re
 from pathlib import Path
 
 DARK_COLORS = {
@@ -18,6 +20,33 @@ LIGHT_COLORS = {
     'text_disabled': '#9CAAC0', 'border': '#D8E2EF', 'hover': '#EDF3FC',
 }
 COLORS = DARK_COLORS
+
+
+def format_log_html(message, timestamp=""):
+    """按日志内容语义着色为 HTML，供各页面日志终端 QTextEdit.append 使用。
+
+    分类优先级: 错误(红) > 警告(橙) > 成功(绿) > 阶段标题(蓝,加粗) > 普通
+    """
+    text = str(message)
+    escaped = html.escape(text).replace("\n", "<br>")
+    prefix = f"[{timestamp}] " if timestamp else ""
+
+    if text.startswith("[警告]"):
+        color, weight = COLORS['warning'], 'normal'
+    elif any(k in text for k in ("✗", "错误", "出错", "失败", "Traceback", "异常", "Error")):
+        color, weight = COLORS['error'], 'normal'
+    elif any(k in text for k in ("警告", "Warning", "未检测到", "不存在", "请先", "跳过", "暂停", "取消", "停止")):
+        color, weight = COLORS['warning'], 'normal'
+    elif any(k in text for k in ("✓", "完成", "成功")):
+        color, weight = COLORS['success'], 'normal'
+    elif (re.search(r"[=\-*#]{3,}", text.strip())
+          or "[Epoch" in text
+          or any(k in text for k in ("开始训练", "开始推理", "开始标注"))):
+        color, weight = COLORS['primary'], 'bold'
+    else:
+        return f"{prefix}{escaped}"
+
+    return f'{prefix}<span style="color:{color}; font-weight:{weight};">{escaped}</span>'
 
 
 def generate_stylesheet(c):
