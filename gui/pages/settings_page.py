@@ -169,7 +169,7 @@ class SettingsPage(QWidget):
         
         # 矩形工具快捷键
         rect_layout = QHBoxLayout()
-        self.rect_tool_shortcut = QLabel(self.settings.value("rect_tool_shortcut", "W"))
+        self.rect_tool_shortcut = QLabel(self.settings.value("rect_tool_shortcut", "Q"))
         self.rect_tool_shortcut.setStyleSheet(f"background-color: {COLORS['background']}; padding: 8px; border-radius: 6px;")
         rect_layout.addWidget(self.rect_tool_shortcut, 1)
         
@@ -193,7 +193,7 @@ class SettingsPage(QWidget):
         
         # 移动工具快捷键
         move_layout = QHBoxLayout()
-        self.move_tool_shortcut = QLabel(self.settings.value("move_tool_shortcut", "V"))
+        self.move_tool_shortcut = QLabel(self.settings.value("move_tool_shortcut", "E"))
         self.move_tool_shortcut.setStyleSheet(f"background-color: {COLORS['background']}; padding: 8px; border-radius: 6px;")
         move_layout.addWidget(self.move_tool_shortcut, 1)
         
@@ -302,11 +302,11 @@ class SettingsPage(QWidget):
         if hasattr(self, 'reset_view_shortcut'):
             self.reset_view_shortcut.setText("R")
         if hasattr(self, 'rect_tool_shortcut'):
-            self.rect_tool_shortcut.setText("W")
+            self.rect_tool_shortcut.setText("Q")
         if hasattr(self, 'poly_tool_shortcut'):
             self.poly_tool_shortcut.setText("P")
         if hasattr(self, 'move_tool_shortcut'):
-            self.move_tool_shortcut.setText("V")
+            self.move_tool_shortcut.setText("E")
         if hasattr(self, 'prev_image_shortcut'):
             self.prev_image_shortcut.setText("A")
         if hasattr(self, 'next_image_shortcut'):

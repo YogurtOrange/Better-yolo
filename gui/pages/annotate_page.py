@@ -5577,9 +5577,9 @@ class AnnotatePage(QWidget):
         
         # 获取快捷键设置
         settings = QSettings("Better-YOLO", "Settings")
-        rect_tool_key = settings.value("rect_tool_shortcut", "W").upper()
+        rect_tool_key = settings.value("rect_tool_shortcut", "Q").upper()
         poly_tool_key = settings.value("poly_tool_shortcut", "P").upper()
-        move_tool_key = settings.value("move_tool_shortcut", "V").upper()
+        move_tool_key = settings.value("move_tool_shortcut", "E").upper()
         delete_key = settings.value("delete_shortcut", "DELETE").upper()
         
         # 处理工具快捷键
