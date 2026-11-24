@@ -19,6 +19,7 @@ class SettingsPage(QWidget):
     # 主题变化信号
     theme_changed = pyqtSignal(str)  # 发送新的主题名称
     ui_scale_changed = pyqtSignal(int)
+    settings_saved = pyqtSignal()  # 配置保存或重置后通知其他页面同步
     
     def __init__(self):
         super().__init__()
@@ -245,12 +246,17 @@ class SettingsPage(QWidget):
         """设置快捷键"""
         from PyQt6.QtWidgets import QInputDialog
         
-        key, ok = QInputDialog.getText(self, "设置快捷键", f"请输入新的快捷键 (单个字母或数字):")
-        if ok and key:
-            # 只取第一个字符
-            new_key = key.upper()[0]
+        prompt = "请输入新的快捷键 (单个字母/数字，或 DELETE / BACKSPACE):"
+        key, ok = QInputDialog.getText(self, "设置快捷键", prompt)
+        if ok and key and key.strip():
+            cleaned = key.strip().upper()
+            if cleaned in ("DELETE", "BACKSPACE", "SPACE", "TAB"):
+                new_key = cleaned
+            else:
+                new_key = cleaned[0]
             self.settings.setValue(setting_key, new_key)
             label.setText(new_key)
+            self.settings_saved.emit()
             QMessageBox.information(self, "设置成功", f"快捷键已设置为: {new_key}")
     
     def browse_path(self, setting_key: str, dialog_title: str):
@@ -283,6 +289,7 @@ class SettingsPage(QWidget):
         # 保存自动保存设置
         self.settings.setValue("auto_save_interval", self.auto_save_interval.value())
         self.settings.setValue("auto_save_enabled", self.auto_save_enabled.isChecked())
+        self.settings_saved.emit()
         
         QMessageBox.information(self, "保存成功", "设置已保存！")
     
@@ -314,14 +321,18 @@ class SettingsPage(QWidget):
         if hasattr(self, 'delete_shortcut'):
             self.delete_shortcut.setText("DELETE")
         
-        # 保存默认快捷键设置
+        # 保存默认快捷键设置与路径/自动保存配置
+        self.settings.setValue("pretrained_path", str(default_pretrained_path))
+        self.settings.setValue("auto_save_interval", 5)
+        self.settings.setValue("auto_save_enabled", True)
         self.settings.setValue("reset_view_shortcut", "R")
-        self.settings.setValue("rect_tool_shortcut", "W")
+        self.settings.setValue("rect_tool_shortcut", "Q")
         self.settings.setValue("poly_tool_shortcut", "P")
-        self.settings.setValue("move_tool_shortcut", "V")
+        self.settings.setValue("move_tool_shortcut", "E")
         self.settings.setValue("prev_image_shortcut", "A")
         self.settings.setValue("next_image_shortcut", "D")
         self.settings.setValue("delete_shortcut", "DELETE")
+        self.settings_saved.emit()
         
         # 发送主题变化信号（默认是深色主题）
         self.theme_changed.emit('dark')

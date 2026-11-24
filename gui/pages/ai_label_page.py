@@ -39,6 +39,7 @@ from core.qwen_annotator import (
     generate_task_prompt,
     fetch_available_models,
     clear_breakpoint,
+    normalize_prompt_lines,
     parse_category_list,
     export_manual_examples,
     register_classes,
@@ -901,16 +902,10 @@ class AiLabelPage(QWidget):
             f"(新增{added}张)，可点击\"AI生成提示词\"让AI参考"
         )
 
-    def build_prompt_text(self):
-        """把表格+附加规则组装成发给AI的任务描述文本
-
-        序号仅用于排序(有数字序号的行按序号排，其余按行序)，
-        类别行格式为 "标签名：描述"，标签名即classes.txt中的类别名。
-        """
+    def get_ordered_table_categories(self):
+        """按序号排序返回当前表格中的所有有效标签行: [(seq, name, desc, row), ...]"""
         rows_data = []
-
         for row in range(self.category_table.rowCount()):
-
             def _cell(col):
                 item = self.category_table.item(row, col)
                 return item.text().strip() if item else ""
@@ -918,19 +913,30 @@ class AiLabelPage(QWidget):
             seq = _cell(0)
             name = _cell(1)
             desc = _cell(2)
-
-            if not name or not desc:
+            if not name:
                 continue
-
             rows_data.append((seq, name, desc, row))
 
-        # 按序号排序: 数字序号按数值排，无序号/非数字的按行序排在后面
         rows_data.sort(
             key=lambda t: (0, int(t[0]), t[3])
             if t[0].isdigit() else (1, 0, t[3])
         )
+        return rows_data
 
-        lines = [f"{name}：{desc}" for _, name, desc, _ in rows_data]
+    def build_prompt_text(self, include_empty_desc: bool = False):
+        """把表格+附加规则组装成发给AI的任务描述文本
+
+        序号仅用于排序(有数字序号的行按序号排，其余按行序)，
+        类别行格式为 "标签名：描述"，标签名即classes.txt中的类别名。
+        include_empty_desc=True 用于“AI生成提示词”阶段，把仅有标签名、描述为空的行也传给大模型补全描述。
+        """
+        rows_data = self.get_ordered_table_categories()
+        lines = []
+        for _, name, desc, _ in rows_data:
+            if desc:
+                lines.append(f"{name}：{desc}")
+            elif include_empty_desc:
+                lines.append(f"{name}：（待结合采样图片与参考示例生成具体视觉特征描述）")
 
         extra = self.te_extra_rules.toPlainText().strip()
 
@@ -943,12 +949,10 @@ class AiLabelPage(QWidget):
         """把AI生成的提示词文本回填到表格
 
         表格已有标签名时(导入的classes.txt或手动添加):
-        标名列原样保留，只更新描述列——AI不允许改标签名；
-        生成的描述按标签名匹配，匹配不上但数量一致时按行序对应。
+        标签名列原样保留，只更新描述列——AI不允许改标签名；
+        支持自动拆分AI用分号连写在同一行的多类别描述，并提取尾部全局规则。
         表格为空时: 类别行 -> 表格行(标签名+描述)，其余行 -> 附加规则
         """
-        cats = parse_category_list(prompt)
-
         # 收集当前表格已有的标签名
         existing = []
         for row in range(self.category_table.rowCount()):
@@ -956,15 +960,31 @@ class AiLabelPage(QWidget):
             if item and item.text().strip():
                 existing.append((row, item.text().strip()))
 
+        known_labels = [lbl for _, lbl in existing]
+        normalized_lines = normalize_prompt_lines(prompt, known_labels=known_labels)
+        cats = parse_category_list(prompt, known_labels=known_labels)
+
+        cat_names_fold = {name.casefold() for name, _ in cats}
+        extra_lines = []
+        for line in normalized_lines:
+            head = re.split(r"[：:=]", line, 1)[0].strip()
+            if head.casefold() in cat_names_fold:
+                continue
+            extra_lines.append(line)
+
         if existing:
-            # 已有标签: 只更新描述列
+            # 已有标签: 只更新描述列（优先精确匹配，其次忽略大小写匹配）
             cat_map = {name: desc for name, desc in cats}
+            cat_map_fold = {name.casefold(): desc for name, desc in cats}
 
             matched = 0
             for row, label in existing:
-                if label in cat_map:
+                desc_val = cat_map.get(label)
+                if desc_val is None:
+                    desc_val = cat_map_fold.get(label.casefold())
+                if desc_val is not None:
                     self.category_table.setItem(
-                        row, 2, QTableWidgetItem(cat_map[label])
+                        row, 2, QTableWidgetItem(desc_val)
                     )
                     matched += 1
 
@@ -976,8 +996,11 @@ class AiLabelPage(QWidget):
                     )
                 matched = len(existing)
 
+            # 若附加规则框为空且AI返回了遮挡/排除等通用规则，自动填入附加规则框
+            if extra_lines and not self.te_extra_rules.toPlainText().strip():
+                self.te_extra_rules.setPlainText("\n".join(extra_lines))
+
             if matched == 0:
-                # 诊断: 帮助定位AI输出格式问题
                 sample = next(iter(cat_map), None)
                 self.append_log(
                     f"[警告] 生成内容未能匹配任何标签"
@@ -993,20 +1016,6 @@ class AiLabelPage(QWidget):
 
         # 表格为空: 类别行进表格，其余行进附加规则
         self.category_table.setRowCount(0)
-        extra_lines = []
-
-        cat_names = {name for name, _ in cats}
-
-        for raw in prompt.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-
-            # 判断是否类别行(与核心解析的分隔符一致)
-            head = re.split(r"[：:=]", line, 1)[0].strip()
-            if head in cat_names:
-                continue  # 类别行，由cats统一回填
-            extra_lines.append(line)
 
         # 按类别表声明顺序回填
         for idx, (name, desc) in enumerate(cats):
@@ -1172,6 +1181,10 @@ class AiLabelPage(QWidget):
     def set_project(self, project_id: int):
         """设置当前项目(切换页面时由主窗口调用)"""
         if project_id == self.current_project_id:
+            if project_id:
+                self.current_project = db.get_project(project_id)
+                self.refresh_project_stats()
+                self.sync_classes_from_project()
             return
 
         # 切换前先把上一个项目的任务配置落盘
@@ -1190,17 +1203,26 @@ class AiLabelPage(QWidget):
                 )
                 self.refresh_project_stats()
                 self.load_task_config()
+                self.sync_classes_from_project()
         else:
             self.current_project = None
+            self._loading_config = True
+            try:
+                self.category_table.setRowCount(0)
+                self.te_extra_rules.clear()
+                self.le_negative.clear()
+            finally:
+                self._loading_config = False
             self.project_label.setText("未选择项目 (请先在导入页面选择)")
             self.project_stats_label.setText("")
 
     # -------------------- 任务配置持久化 --------------------
 
-    def _task_config_path(self):
-        if not self.current_project:
+    def _task_config_path(self, project: dict = None):
+        target_project = project or self.current_project
+        if not target_project:
             return None
-        storage = self.current_project.get('storage_path')
+        storage = target_project.get('storage_path')
         if not storage:
             return None
         return Path(storage) / "ai_task_config.json"
@@ -1209,8 +1231,8 @@ class AiLabelPage(QWidget):
         if not self._loading_config:
             self._config_timer.start()
 
-    def save_task_config(self):
-        """把类别表格/附加规则/负样本保存到项目目录"""
+    def _write_task_config_file(self):
+        """仅将当前UI中的类别表格/附加规则/负样本写入 ai_task_config.json（不触发反向DB同步）"""
         path = self._task_config_path()
         if not path:
             return
@@ -1243,8 +1265,180 @@ class AiLabelPage(QWidget):
         except OSError as e:
             self.append_log(f"[警告] 任务配置保存失败: {e}")
 
-        # 表格中的标签名同步注册到项目类别表
+    def save_task_config(self):
+        """把类别表格/附加规则/负样本保存到项目目录，并将新标签注册进项目数据库"""
+        self._write_task_config_file()
         self._sync_classes_to_project()
+
+    @staticmethod
+    def _parse_project_class_list(project) -> list:
+        """按类别ID顺序解析项目 classes 列表，返回非空标签名列表"""
+        if not project:
+            return []
+        classes = project.get('classes') or []
+        if isinstance(classes, str):
+            try:
+                classes = json.loads(classes)
+            except (ValueError, TypeError):
+                classes = []
+        if not isinstance(classes, list):
+            return []
+        ordered = sorted(
+            (c for c in classes if isinstance(c, dict)),
+            key=lambda c: c.get('id', 0)
+        )
+        names = []
+        seen = set()
+        for c in ordered:
+            name = str(c.get('name') or '').strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
+    def sync_classes_from_project(self, change_info: dict = None):
+        """从项目的 classes 列表向 AI 标注页类别表同步标签名（描述列保持留空，交由 AI 生成）"""
+        if not self.current_project_id:
+            return
+
+        project = db.get_project(self.current_project_id)
+        if not project:
+            return
+        self.current_project = project
+
+        project_names = self._parse_project_class_list(project)
+        change_info = change_info or {}
+        action = change_info.get('action')
+
+        changed = False
+        self._loading_config = True
+        try:
+            def _cell_text(r, c):
+                it = self.category_table.item(r, c)
+                return it.text().strip() if it else ""
+
+            # 1) 处理标注页重命名类别：更新标签名，完整保留原有的序号与AI描述
+            if action == 'rename':
+                old_name = (change_info.get('old_name') or '').strip()
+                new_name = (change_info.get('new_name') or '').strip()
+                if old_name and new_name and old_name != new_name:
+                    for r in range(self.category_table.rowCount()):
+                        if _cell_text(r, 1) == old_name:
+                            self.category_table.setItem(r, 1, QTableWidgetItem(new_name))
+                            changed = True
+
+            # 2) 处理标注页删除类别：同步从AI类别表中移除对应标签行
+            elif action == 'delete':
+                deleted_name = (change_info.get('name') or '').strip()
+                if deleted_name:
+                    for r in range(self.category_table.rowCount() - 1, -1, -1):
+                        if _cell_text(r, 1) == deleted_name:
+                            self.category_table.removeRow(r)
+                            changed = True
+
+            # 3) 将项目 classes 中尚未出现在表格里的标签名追加进来（描述留空，不自动生成）
+            existing_names = {
+                _cell_text(r, 1)
+                for r in range(self.category_table.rowCount())
+                if _cell_text(r, 1)
+            }
+
+            max_seq = 0
+            for r in range(self.category_table.rowCount()):
+                seq_txt = _cell_text(r, 0)
+                if seq_txt.isdigit():
+                    max_seq = max(max_seq, int(seq_txt))
+
+            for cls_name in project_names:
+                if cls_name in existing_names:
+                    continue
+
+                # 优先复用空白占位行，否则在末尾新增一行
+                blank_row = None
+                for r in range(self.category_table.rowCount()):
+                    if not _cell_text(r, 1) and not _cell_text(r, 2):
+                        blank_row = r
+                        break
+
+                if blank_row is not None:
+                    row = blank_row
+                    if not _cell_text(row, 0):
+                        max_seq += 1
+                        self.category_table.setItem(row, 0, QTableWidgetItem(str(max_seq)))
+                else:
+                    row = self.category_table.rowCount()
+                    self.category_table.insertRow(row)
+                    max_seq += 1
+                    self.category_table.setItem(row, 0, QTableWidgetItem(str(max_seq)))
+
+                self.category_table.setItem(row, 1, QTableWidgetItem(cls_name))
+                self.category_table.setItem(row, 2, QTableWidgetItem(""))
+                existing_names.add(cls_name)
+                changed = True
+        finally:
+            self._loading_config = False
+
+        if changed:
+            self._write_task_config_file()
+
+    def on_external_project_classes_changed(self, project_id: int, change_info: dict = None):
+        """响应标注页类别变动：若当前已打开该项目则直接同步表格；否则同步更新磁盘上的 ai_task_config.json"""
+        if not project_id:
+            return
+        if self.current_project_id == project_id:
+            self.sync_classes_from_project(change_info)
+            return
+
+        # 当前AI标注页尚未切换到该项目时，若项目目录下已有 ai_task_config.json，同步维护其标签名
+        project = db.get_project(project_id)
+        path = self._task_config_path(project)
+        if not (project and path and path.exists()):
+            return
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        categories = list(data.get("categories") or [])
+        change_info = change_info or {}
+        action = change_info.get('action')
+        changed = False
+
+        if action == 'rename':
+            old_name = (change_info.get('old_name') or '').strip()
+            new_name = (change_info.get('new_name') or '').strip()
+            if old_name and new_name and old_name != new_name:
+                for cat in categories:
+                    if str(cat.get('name') or '').strip() == old_name:
+                        cat['name'] = new_name
+                        changed = True
+        elif action == 'delete':
+            deleted_name = (change_info.get('name') or '').strip()
+            if deleted_name:
+                new_cats = [c for c in categories if str(c.get('name') or '').strip() != deleted_name]
+                if len(new_cats) != len(categories):
+                    categories = new_cats
+                    changed = True
+
+        existing_names = {str(c.get('name') or '').strip() for c in categories if str(c.get('name') or '').strip()}
+        max_seq = max(
+            (int(str(c.get('seq')).strip()) for c in categories if str(c.get('seq') or '').strip().isdigit()),
+            default=0
+        )
+        for cls_name in self._parse_project_class_list(project):
+            if cls_name not in existing_names:
+                max_seq += 1
+                categories.append({"seq": str(max_seq), "name": cls_name, "desc": ""})
+                existing_names.add(cls_name)
+                changed = True
+
+        if changed:
+            data["categories"] = categories
+            try:
+                path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError:
+                pass
 
     def _sync_classes_to_project(self):
         """把类别表格中的标签名注册进项目classes表
@@ -1495,13 +1689,25 @@ class AiLabelPage(QWidget):
                         "模式并重新优化负样本排除"
                     )
 
+        # 若表格中已有标签名（包括从02标注页同步过来、描述为空的标签），显式约束AI逐一补全描述且不得改名或增删
+        ordered_cats = self.get_ordered_table_categories()
+        if ordered_cats:
+            table_label_names = [name for _, name, _, _ in ordered_cats]
+            label_constraint = (
+                f"固定类别表约束: 用户已在类别表中指定了共 {len(table_label_names)} 个标签名"
+                f"（按顺序依次为：{', '.join(table_label_names)}）。"
+                "生成的提示词必须为其中每一个标签各输出一行“标签名：描述”，"
+                "冒号前的标签名必须与上述名称逐字一致、顺序一致，严禁遗漏、改名或新增其他标签。"
+            )
+            extra_note = (extra_note + "\n\n" + label_constraint).strip() if extra_note else label_constraint
+
         self.btn_gen_prompt.setEnabled(False)
 
         self.prompt_worker = PromptGenWorker({
             "model": self.le_model.text().strip() or DEFAULT_MODEL,
             "sample_images": sample_images,
             "example_images": example_images,
-            "previous_prompt": self.build_prompt_text(),
+            "previous_prompt": self.build_prompt_text(include_empty_desc=True),
             "feedback": dlg.get_feedback(),
             "megapixels": self.sb_megapixels.value(),
             "max_retry": self.sb_retry.value(),
@@ -1556,7 +1762,18 @@ class AiLabelPage(QWidget):
         ]
 
         if not prompt and not example_images:
-            QMessageBox.warning(self, "提示", "请在类别表格中添加类别（含描述）或添加示例图片")
+            empty_desc_labels = [
+                name for _, name, desc, _ in self.get_ordered_table_categories()
+                if not desc
+            ]
+            if empty_desc_labels:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "当前类别表中的标签尚未填写描述。\n请先点击「AI生成提示词」由 AI 自动生成描述，或手动补充描述后再开始标注。"
+                )
+            else:
+                QMessageBox.warning(self, "提示", "请在类别表格中添加类别（含描述）或添加示例图片")
             return
 
         api_key = self._get_api_key()

@@ -54,6 +54,27 @@ results/
 *.swp
 *.swo
 
+# ==================== AI Agent 文档与配置(仅本地, 不推送) ====================
+# 面向 AI 编码助手的说明文件
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.copilot-instructions.md
+.cursorrules
+.windsurfrules
+.aider.conf.yml
+.aiderignore
+# 各工具的本地配置/记忆目录
+.agent/
+.agents/
+.claude/
+.cursor/
+.codex/
+.gemini/
+.windsurf/
+.trae/
+.aider/
+
 # ==================== IDE / 系统文件 ====================
 .vscode/
 .idea/

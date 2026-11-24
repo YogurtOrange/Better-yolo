@@ -821,8 +821,8 @@ negative 是"负样本排除"内容: 画面里存在但不是标注
   冒号、描述三者缺一不可)，例如:
   001：装甲车（'装甲车'指靶纸上印有的橙黑条纹虎形
   图案，四肢着地、体型明显大于画面中其他图案，框
-  紧贴其身体可见外轮廓，不含靶纸和网格线）;
-- 每个类别一行，行与行之间不要有空行；
+  紧贴其身体可见外轮廓，不含靶纸和网格线）
+- 每个类别必须独占一行，JSON 字符串中不同类别之间必须使用换行符 \n 分隔，严禁用分号“；”把多个类别连写在同一行，行与行之间不要有空行；
 - 类别列表之后必须另起一行写:
   若目标被部分遮挡，仅框出可见部分的完整外轮廓。
 - 如有其他排除要求(如排除靶板/地面/阴影/支架等)，
@@ -1008,16 +1008,115 @@ META_WORDS = {
 }
 
 
-def parse_category_list(prompt):
+GLOBAL_RULE_PREFIXES = (
+    "若目标", "如果目标", "当目标",
+    "除以上", "除上述",
+    "每个目标", "同一目标", "所有目标",
+    "注意：", "注意:", "要求：", "要求:", "补充：", "补充:",
+)
+
+
+def normalize_prompt_lines(prompt, known_labels=None):
+    """将大模型用分号/句号连写在同一行的多类别提示词与附加规则拆分为独立行
+
+    仅在括号外层(depth==0)切分，绝不破坏描述括号内的正常标点。
+    """
+    raw_text = (prompt or "").strip()
+    if not raw_text:
+        return []
+
+    sorted_labels = sorted(
+        {str(k).strip() for k in (known_labels or []) if str(k).strip()},
+        key=len,
+        reverse=True,
+    )
+    known_pattern = None
+    if sorted_labels:
+        alt = "|".join(re.escape(lbl) for lbl in sorted_labels)
+        known_pattern = re.compile(rf"^(?:{alt})\s*[：:=]", re.IGNORECASE)
+
+    generic_cat_pattern = re.compile(
+        r"^([A-Za-z0-9_\-\u4e00-\u9fff]{1,25})\s*[：:=]\s*\S"
+    )
+
+    result_lines = []
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        buf = []
+        depth = 0
+        i = 0
+        n = len(line)
+
+        while i < n:
+            ch = line[i]
+            if ch in "（(":
+                depth += 1
+                buf.append(ch)
+                i += 1
+                continue
+            if ch in "）)":
+                depth = max(0, depth - 1)
+                buf.append(ch)
+                if depth == 0:
+                    rest = line[i + 1:].lstrip()
+                    if (known_pattern and known_pattern.match(rest)) or rest.startswith(GLOBAL_RULE_PREFIXES):
+                        seg = "".join(buf).strip()
+                        if seg:
+                            result_lines.append(seg)
+                        buf = []
+                        i += 1
+                        while i < n and line[i].isspace():
+                            i += 1
+                        continue
+                i += 1
+                continue
+
+            if depth == 0 and ch in "；;。":
+                rest = line[i + 1:].lstrip()
+                should_split = False
+                if rest:
+                    if known_pattern and known_pattern.match(rest):
+                        should_split = True
+                    elif rest.startswith(GLOBAL_RULE_PREFIXES):
+                        should_split = True
+                    elif ch in "；;" and generic_cat_pattern.match(rest):
+                        should_split = True
+
+                if should_split:
+                    seg = "".join(buf).strip()
+                    if seg:
+                        result_lines.append(seg)
+                    buf = []
+                    i += 1
+                    while i < n and line[i].isspace():
+                        i += 1
+                    continue
+
+            buf.append(ch)
+            i += 1
+
+        tail = "".join(buf).strip()
+        if tail:
+            result_lines.append(tail)
+
+    return result_lines
+
+
+def parse_category_list(prompt, known_labels=None):
     """解析提示词中的类别表，返回[(标签名, 描述), ...]
 
     标签名原样保留——冒号前的名称就是classes.txt里存的
     标签名(纯数字编号也是合法标签名，不得改名)。
+    兼容大模型用分号把多个“标签名：描述”连写在同一行的情况。
     """
 
     cats = []
 
-    for raw in prompt.splitlines():
+    for raw in normalize_prompt_lines(prompt, known_labels=known_labels):
 
         line = raw.strip()
 
@@ -1030,7 +1129,7 @@ def parse_category_list(prompt):
             continue
 
         name = name.strip().rstrip("|\\ \t").strip()
-        desc = desc.strip().rstrip("|\\ \t，,；;").strip()
+        desc = desc.strip().rstrip("|\\ \t，,；;。").strip()
 
         if not name or not desc or len(desc) < 2:
             continue

@@ -56,6 +56,41 @@ class VideoImportThread(QThread):
             self.finished.emit(False, f"导入失败: {str(e)}", 0, 0)
 
 
+class ImageBatchImportThread(QThread):
+    """文件夹/多图批量导入后台线程（避免主线程I/O与MD5计算阻塞UI）"""
+    progress_updated = pyqtSignal(int, str)
+    finished = pyqtSignal(bool, str, int, int, str)  # success, message, imported, skipped, label
+
+    def __init__(self, project_id: int, folder_path: str = None, file_paths: List[str] = None):
+        super().__init__()
+        self.project_id = project_id
+        self.folder_path = folder_path
+        self.file_paths = file_paths or []
+
+    def run(self):
+        label = "文件夹" if self.folder_path else "图片"
+        try:
+            import_manager = ImportManager(self.project_id)
+
+            def progress_callback(progress, message):
+                self.progress_updated.emit(progress, message)
+
+            if self.folder_path:
+                imported, skipped = import_manager.import_folder(
+                    self.folder_path,
+                    progress_callback=progress_callback,
+                )
+            else:
+                imported, skipped = import_manager.import_images(
+                    self.file_paths,
+                    progress_callback=progress_callback,
+                )
+
+            self.finished.emit(True, f"{label}导入完成", imported, skipped, label)
+        except Exception as e:
+            self.finished.emit(False, f"导入过程中发生错误:\n{str(e)}", 0, 0, label)
+
+
 class ImageLoadWorker(QThread):
     """图片加载工作线程"""
     
@@ -981,7 +1016,8 @@ class ImportPage(QWidget):
         if not ok:
             return
         
-        # 显示进度条
+        # 显示进度条并锁定导入按钮，防止并发重复导入
+        self._set_import_buttons_enabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
@@ -1183,13 +1219,7 @@ class ImportPage(QWidget):
             )
         
         # 检查项目是否已经有标注
-        project_images = db.get_project_images(self.current_project_id)
-        has_annotations = False
-        for image in project_images:
-            annotations = db.get_image_annotations(image['id'])
-            if annotations:
-                has_annotations = True
-                break
+        has_annotations = db.project_has_annotations(self.current_project_id)
         
         # 如果有标注，提示是否覆盖
         overwrite = False
@@ -1271,13 +1301,7 @@ class ImportPage(QWidget):
             return
         
         # 检查项目是否已经有标注
-        project_images = db.get_project_images(self.current_project_id)
-        has_annotations = False
-        for image in project_images:
-            annotations = db.get_image_annotations(image['id'])
-            if annotations:
-                has_annotations = True
-                break
+        has_annotations = db.project_has_annotations(self.current_project_id)
         
         # 如果有标注，提示是否覆盖
         overwrite = False
@@ -1338,13 +1362,7 @@ class ImportPage(QWidget):
             return
         
         # 检查项目是否已经有标注
-        project_images = db.get_project_images(self.current_project_id)
-        has_annotations = False
-        for image in project_images:
-            annotations = db.get_image_annotations(image['id'])
-            if annotations:
-                has_annotations = True
-                break
+        has_annotations = db.project_has_annotations(self.current_project_id)
         
         # 如果有标注，提示是否覆盖
         overwrite = False
@@ -1394,76 +1412,84 @@ class ImportPage(QWidget):
         self.import_thread.finished.connect(self.on_annotation_import_finished)
         self.import_thread.start()
     
-    def process_folder_import(self, folder_path: str):
-        """处理文件夹导入"""
+    def _set_import_buttons_enabled(self, enabled: bool):
+        """导入任务运行期间禁用导入按钮，避免重复触发并发写库"""
+        for attr in ('btn_import_folder', 'btn_import_images', 'btn_import_video', 'btn_import_annotations'):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+
+    def _start_async_image_import(self, folder_path: str = None, file_paths: List[str] = None):
+        """在后台线程中异步导入文件夹或多张图片"""
         if not self.current_project_id:
             return
-        
-        try:
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            before_ids = {img.get('id') for img in self.images}
-            
-            import_manager = ImportManager(self.current_project_id)
-            imported, skipped = import_manager.import_folder(
-                folder_path,
-                progress_callback=self.update_import_progress
-            )
-            if imported > 0:
+        if hasattr(self, 'batch_import_thread') and self.batch_import_thread and self.batch_import_thread.isRunning():
+            QMessageBox.information(self, "提示", "当前已有导入任务正在进行，请稍候...")
+            return
+
+        self._batch_import_before_ids = {img.get('id') for img in self.images}
+        self._set_import_buttons_enabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+
+        self.batch_import_thread = ImageBatchImportThread(
+            project_id=self.current_project_id,
+            folder_path=folder_path,
+            file_paths=file_paths,
+        )
+        self.batch_import_thread.progress_updated.connect(self.update_import_progress)
+        self.batch_import_thread.finished.connect(self.on_batch_import_finished)
+        self.batch_import_thread.start()
+
+    def on_batch_import_finished(self, success: bool, message: str, imported: int, skipped: int, label: str):
+        """后台文件夹/图片导入完成回调"""
+        self._set_import_buttons_enabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFormat("%p%")
+
+        before_ids = getattr(self, '_batch_import_before_ids', None)
+        if hasattr(self, '_batch_import_before_ids'):
+            delattr(self, '_batch_import_before_ids')
+
+        if success:
+            if imported > 0 and isinstance(before_ids, set):
                 appended = self._append_imported_images(before_ids)
                 if appended == 0:
-                    # 兜底：若无法识别新增项，回退全量重载
                     self.load_project_images()
-            
+            elif imported > 0:
+                self.load_project_images()
+
+            skip_hint = f"\n跳过(重复或无效): {skipped} 张" if skipped else f"\n跳过: {skipped} 张"
             QMessageBox.information(
                 self, "导入完成",
-                f"文件夹导入完成！\n成功导入: {imported} 张\n跳过: {skipped} 张"
+                f"{label}导入完成！\n成功导入: {imported} 张{skip_hint}"
             )
-            
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+        else:
+            QMessageBox.critical(self, "导入失败", message)
+
+    def process_folder_import(self, folder_path: str):
+        """处理文件夹导入（后台线程执行）"""
+        self._start_async_image_import(folder_path=folder_path)
     
     def process_image_import(self, file_paths: List[str]):
-        """处理图像导入"""
-        if not self.current_project_id:
-            return
-        
-        try:
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            before_ids = {img.get('id') for img in self.images}
-            
-            import_manager = ImportManager(self.current_project_id)
-            imported, skipped = import_manager.import_images(
-                file_paths,
-                progress_callback=self.update_import_progress
-            )
-            if imported > 0:
-                appended = self._append_imported_images(before_ids)
-                if appended == 0:
-                    # 兜底：若无法识别新增项，回退全量重载
-                    self.load_project_images()
-            
-            QMessageBox.information(
-                self, "导入完成",
-                f"图片导入完成！\n成功导入: {imported} 张\n跳过: {skipped} 张"
-            )
-            
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
+        """处理图像导入（后台线程执行）"""
+        self._start_async_image_import(file_paths=file_paths)
     
     def update_import_progress(self, progress: int, message: str):
         """更新导入进度"""
+        self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(progress)
+        if message:
+            self.progress_bar.setFormat(f"%p% - {message}")
     
     def on_video_import_finished(self, success: bool, message: str, imported: int, skipped: int):
         """视频导入完成回调"""
+        self._set_import_buttons_enabled(True)
         # 隐藏进度条
         self.progress_bar.setVisible(False)
+        self.progress_bar.setFormat("%p%")
         
         if success:
             before_ids = getattr(self, '_video_import_before_ids', None)

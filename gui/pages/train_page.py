@@ -222,14 +222,13 @@ class TrainingThread(QThread):
             suffix = task_suffix_map.get(task, task)
             model_name = f"{model_prefix}{model_size}-{suffix}.pt"
         
-        # 从pretrained目录加载（使用相对路径）
+        # 从预训练模型目录加载（优先使用偏好设置中的路径）
         import os
-        from pathlib import Path
-        app_root = Path(__file__).parent.parent.parent  # 应用根目录
-        pretrained_dir = app_root / "pretrained"
+        from core.model_manager import get_pretrained_dir
+        pretrained_dir = get_pretrained_dir()
         model_path = os.path.join(pretrained_dir, model_name)
         
-        # 如果本地不存在，则使用模型名称（会自动下载）
+        # 如果本地不存在，则使用模型名称（会自动下载到预训练目录）
         if os.path.exists(model_path):
             self.log_message.emit(f"加载本地模型: {model_path}")
             load_path = model_path
@@ -239,6 +238,8 @@ class TrainingThread(QThread):
             load_path = model_name
         
         # 加载预训练模型
+        original_hub_dir = os.environ.get('YOLO_HUB_DIR')
+        os.environ['YOLO_HUB_DIR'] = str(pretrained_dir)
         try:
             model = YOLO(load_path)
             self.log_message.emit(f"✓ 模型加载成功")
@@ -246,6 +247,11 @@ class TrainingThread(QThread):
             self.log_message.emit(f"✗ 模型加载失败: {e}")
             self.training_finished.emit(False, f"模型加载失败: {e}")
             return
+        finally:
+            if original_hub_dir:
+                os.environ['YOLO_HUB_DIR'] = original_hub_dir
+            else:
+                os.environ.pop('YOLO_HUB_DIR', None)
         
         # 准备数据配置
         data_yaml = self.prepare_data_yaml()

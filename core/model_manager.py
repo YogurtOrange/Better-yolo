@@ -62,15 +62,40 @@ ULTRALYTICS_MODELS = {
 }
 
 
+def get_pretrained_dir() -> Path:
+    """获取预训练模型目录（优先读取偏好设置，回退到软件根目录下的 pretrained）"""
+    app_root = Path(__file__).parent.parent
+    default_dir = app_root / "pretrained"
+    configured_dir = None
+
+    try:
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("Better-YOLO", "Settings")
+        raw_path = settings.value("pretrained_path", "")
+        if raw_path and str(raw_path).strip():
+            configured_dir = Path(str(raw_path).strip())
+    except Exception:
+        configured_dir = None
+
+    target_dir = configured_dir if configured_dir is not None else default_dir
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir
+    except Exception:
+        default_dir.mkdir(parents=True, exist_ok=True)
+        return default_dir
+
+
 class ModelManager:
     """模型管理器"""
     
     def __init__(self):
         self.models = {}
-        # 使用基于应用根目录的相对路径
-        app_root = Path(__file__).parent.parent  # 向上两级到sfyolo根目录
-        self.pretrained_dir = app_root / "pretrained"
-        self.pretrained_dir.mkdir(exist_ok=True)
+
+    @property
+    def pretrained_dir(self) -> Path:
+        """动态获取预训练模型目录，修改设置后立即生效"""
+        return get_pretrained_dir()
     
     def get_model_path(self, version: str, size: str, task: str = "detect") -> Path:
         """获取模型路径
@@ -144,12 +169,8 @@ class ModelManager:
                     "world": "world"
                 }
                 
-                # 构建模型名称
-                if task == "detect":
-                    model_name = f"{version.lower()}{size}"
-                else:
-                    suffix = task_suffix_map.get(task, task)
-                    model_name = f"{version.lower()}{size}-{suffix}"
+                # 构建模型名称（使用ULTRALYTICS_MODELS的真实prefix，兼容yolo11/yolo12/yolo26）
+                model_name = model_path.name
                 
                 # 设置环境变量，指定模型下载路径
                 import os

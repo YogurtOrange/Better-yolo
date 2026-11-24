@@ -20,7 +20,7 @@ import math
 from gui.pages.auto_label_dialog import AutoLabelDialog
 from gui.pages.batch_process_dialog import BatchProcessDialog
 from core.auto_labeler import BatchLabelingManager
-from core.model_manager import ModelManager
+from core.model_manager import ModelManager, get_pretrained_dir
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QPoint, QRect, QTimer, QPointF
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QKeyEvent, QMouseEvent, QWheelEvent, QAction, QIcon, QPen, QBrush, QShortcut, QKeySequence
 import cv2
@@ -136,12 +136,16 @@ class SAMMemoryPredictorManager:
             self._release_locked()
 
             from ultralytics.models.sam import SAM2DynamicInteractivePredictor
+            resolved_model = model_file
+            candidate_pretrained = get_pretrained_dir() / model_file
+            if not os.path.exists(resolved_model) and candidate_pretrained.exists():
+                resolved_model = str(candidate_pretrained)
             overrides = dict(
                 conf=conf,
                 task="segment",
                 mode="predict",
                 imgsz=imgsz,
-                model=model_file,
+                model=resolved_model,
                 save=False,
                 device=device,
                 verbose=False,
@@ -256,10 +260,11 @@ class SAMInferenceWorker(QThread):
             model_file = self.sam_config.get('model_file', 'sam_b.pt')
             device = self.sam_config.get('device', 'cpu')
             
-            # 检查模型文件是否存在
+            # 检查模型文件是否存在（含偏好设置中的预训练模型路径）
             import os
             model_paths = [
                 model_file,
+                str(get_pretrained_dir() / model_file),
                 os.path.join('models', model_file),
                 os.path.join(os.path.expanduser('~'), '.cache', 'ultralytics', model_file),
             ]
@@ -530,8 +535,9 @@ class AnnotationCanvas(QFrame):
         # 当前悬停的多边形顶点 (annotation_id, vertex_index) / None
         self.hover_vertex = None
         
-        # 类别颜色（动态获取）
+        # 类别颜色与名称映射（动态获取，仅用于画布显示）
         self.class_colors = {}
+        self.class_names = {}
         
         # 当前选中的类别ID
         self.current_class_id = 0
@@ -882,8 +888,122 @@ class AnnotationCanvas(QFrame):
                 self.draw_obb(painter, data, is_selected)
 
             # 锁定的标注绘制锁形标记(人工修改过或手动锁定)
-            if (annotation.get('attributes') or {}).get('locked'):
+            has_lock = bool((annotation.get('attributes') or {}).get('locked'))
+            if has_lock:
                 self.draw_lock_marker(painter, ann_type, data)
+
+            # 在画布框体上显示类别名徽标（纯UI渲染，不写入任何导出的txt文件）
+            label_text = self._get_class_label_text(class_id, annotation.get('class_name', ''))
+            if label_text:
+                anchor = self._get_annotation_label_anchor(ann_type, data)
+                if anchor is not None:
+                    self.draw_class_label(
+                        painter, anchor, label_text, color,
+                        is_selected=is_selected, has_lock=has_lock
+                    )
+
+    def _get_class_label_text(self, class_id: int, fallback_name: str = "") -> str:
+        """获取用于画布显示的类别名称"""
+        if class_id in self.class_names and self.class_names[class_id]:
+            return str(self.class_names[class_id]).strip()
+        return str(fallback_name or "").strip()
+
+    def _get_annotation_label_anchor(self, ann_type: str, data: Dict) -> Optional[QPoint]:
+        """计算标注类别名标签在控件坐标系下的锚点（左上角/最高顶点）"""
+        if ann_type == 'bbox':
+            x = data.get('x', 0)
+            y = data.get('y', 0)
+            width = data.get('width', 0)
+            height = data.get('height', 0)
+            p1 = self.image_to_widget(x, y)
+            p2 = self.image_to_widget(x + width, y + height)
+            return QPoint(min(p1.x(), p2.x()), min(p1.y(), p2.y()))
+        elif ann_type == 'polygon':
+            pts = data.get('points', [])
+            if not pts:
+                return None
+            widget_pts = [self.image_to_widget(pt['x'], pt['y']) for pt in pts if 'x' in pt and 'y' in pt]
+            return min(widget_pts, key=lambda p: (p.y(), p.x())) if widget_pts else None
+        elif ann_type == 'keypoint':
+            kps = [kp for kp in data.get('keypoints', []) if kp.get('visible', 1)]
+            if not kps:
+                return None
+            widget_pts = [self.image_to_widget(kp.get('x', 0), kp.get('y', 0)) for kp in kps]
+            return min(widget_pts, key=lambda p: (p.y(), p.x())) if widget_pts else None
+        elif ann_type == 'obb':
+            pts = data.get('points', [])
+            if pts and isinstance(pts[0], dict) and 'x' in pts[0] and 'y' in pts[0]:
+                widget_pts = [self.image_to_widget(pt['x'], pt['y']) for pt in pts]
+                return min(widget_pts, key=lambda p: (p.y(), p.x()))
+            x = data.get('x', 0)
+            y = data.get('y', 0)
+            width = data.get('width', 0)
+            height = data.get('height', 0)
+            angle = data.get('angle', 0)
+            center = self.image_to_widget(x, y)
+            half_w = width * self.image_scale / 2
+            half_h = height * self.image_scale / 2
+            corners = []
+            for dx, dy in ((half_w, -half_h), (-half_w, -half_h), (-half_w, half_h), (half_w, half_h)):
+                rx = dx * math.cos(angle) - dy * math.sin(angle)
+                ry = dx * math.sin(angle) + dy * math.cos(angle)
+                corners.append(QPoint(int(center.x() + rx), int(center.y() + ry)))
+            return min(corners, key=lambda p: (p.y(), p.x()))
+        return None
+
+    def draw_class_label(
+        self,
+        painter: QPainter,
+        anchor: QPoint,
+        label_text: str,
+        color: QColor,
+        is_selected: bool = False,
+        has_lock: bool = False,
+    ):
+        """在目标框左上角绘制类别名胶囊标签（贴顶自动内移防裁切，自适应文字深浅对比度）"""
+        if not label_text or anchor is None:
+            return
+
+        painter.save()
+        try:
+            font = ui_font("Microsoft YaHei", 9, QFont.Weight.Bold)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+
+            pad_x = max(4, ui_pixels(6))
+            pad_y = max(2, ui_pixels(2))
+            tag_w = fm.horizontalAdvance(label_text) + pad_x * 2
+            tag_h = fm.height() + pad_y * 2
+
+            tx = anchor.x()
+            ty = anchor.y() - tag_h - 1
+
+            # 靠近图片或画布上边缘时自动翻入框内左上角，并避让锁定小图标
+            top_limit = max(2, self.image_offset.y())
+            if ty < top_limit:
+                ty = anchor.y() + 2
+                if has_lock:
+                    tx = anchor.x() + max(15, ui_pixels(16))
+
+            # 防止右侧超出画布被截断
+            max_x = max(2, self.width() - tag_w - 2)
+            tx = max(2, min(tx, max_x))
+
+            tag_rect = QRect(tx, ty, tag_w, tag_h)
+            bg_color = QColor(color.red(), color.green(), color.blue(), 235 if is_selected else 205)
+            border_color = color.darker(115)
+
+            painter.setPen(QPen(border_color, 1))
+            painter.setBrush(QBrush(bg_color))
+            painter.drawRoundedRect(tag_rect, 3, 3)
+
+            # 根据背景色感知亮度自动选择深色或白色文字，保证任意类别颜色下清晰可读
+            luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+            text_color = QColor(20, 20, 20) if luminance > 165 else QColor(255, 255, 255)
+            painter.setPen(text_color)
+            painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, label_text)
+        finally:
+            painter.restore()
 
     def draw_lock_marker(self, painter: QPainter, ann_type: str, data: Dict):
         """在锁定的标注角落绘制小锁图标"""
@@ -1089,24 +1209,39 @@ class AnnotationCanvas(QFrame):
             )
             painter.drawRect(handle_rect)
     
+    def _get_active_draw_color(self) -> QColor:
+        """获取当前选中类别对应的绘制颜色（无类别时回退主色）"""
+        raw = self.class_colors.get(self.current_class_id)
+        if raw:
+            c = QColor(raw) if isinstance(raw, str) else QColor(raw)
+            if c.isValid():
+                return c
+        return QColor(COLORS['primary'])
+
     def draw_drawing_rectangle(self, painter: QPainter):
-        """绘制正在绘制的矩形"""
-        pen = QPen(QColor(COLORS['primary']))
+        """绘制正在绘制的矩形（同步实时预览当前类别名）"""
+        draw_color = self._get_active_draw_color()
+        pen = QPen(draw_color)
         pen.setWidth(2)
         pen.setStyle(Qt.PenStyle.DashLine)
         painter.setPen(pen)
         
-        # 使用主色调的半透明版本
-        primary_color = QColor(COLORS['primary'])
-        primary_color.setAlpha(50)
-        painter.setBrush(QBrush(primary_color))
+        fill_color = QColor(draw_color)
+        fill_color.setAlpha(50)
+        painter.setBrush(QBrush(fill_color))
         
         rect = QRect(self.start_point, self.current_point)
         painter.drawRect(rect)
+
+        label_text = self._get_class_label_text(self.current_class_id)
+        if label_text:
+            norm_rect = rect.normalized()
+            self.draw_class_label(painter, norm_rect.topLeft(), label_text, draw_color, is_selected=True)
     
     def draw_drawing_polygon(self, painter: QPainter):
-        """绘制正在绘制的多边形"""
-        pen = QPen(QColor(COLORS['primary']))
+        """绘制正在绘制的多边形（同步实时预览当前类别名）"""
+        draw_color = self._get_active_draw_color()
+        pen = QPen(draw_color)
         pen.setWidth(2)
         painter.setPen(pen)
         
@@ -1122,6 +1257,11 @@ class AnnotationCanvas(QFrame):
         # 绘制从最后一点到当前鼠标的线
         if len(self.polygon_points) > 0 and self.current_point:
             painter.drawLine(self.polygon_points[-1], self.current_point)
+
+        label_text = self._get_class_label_text(self.current_class_id)
+        if label_text and self.polygon_points:
+            anchor = min(self.polygon_points, key=lambda p: (p.y(), p.x()))
+            self.draw_class_label(painter, anchor, label_text, draw_color, is_selected=True)
     
     def draw_drawing_obb(self, painter: QPainter):
         """绘制正在绘制的旋转矩形"""
@@ -1214,6 +1354,13 @@ class AnnotationCanvas(QFrame):
             painter.drawEllipse(p2, 4, 4)
             painter.drawEllipse(p3, 4, 4)
             painter.drawEllipse(p4, 4, 4)
+
+        label_text = self._get_class_label_text(self.current_class_id)
+        if label_text and self.obb_points:
+            anchor = min(self.obb_points, key=lambda p: (p.y(), p.x()))
+            self.draw_class_label(
+                painter, anchor, label_text, self._get_active_draw_color(), is_selected=True
+            )
     
     def draw_guide_lines(self, painter: QPainter):
         """绘制鼠标辅助线"""
@@ -1904,13 +2051,26 @@ class AnnotationCanvas(QFrame):
             # 完成多边形绘制
             if self.current_tool == 'polygon' and len(self.polygon_points) >= 3:
                 self.create_polygon_annotation()
-        elif event.key() == Qt.Key.Key_Delete:
+        elif self._matches_delete_shortcut(event, settings):
             # 删除选中的标注
             if self.selected_annotation_id is not None:
                 self.annotation_deleted.emit(self.selected_annotation_id)
         else:
             # 将未处理的事件传递给父组件
             self.parent().keyPressEvent(event)
+
+    @staticmethod
+    def _matches_delete_shortcut(event: QKeyEvent, settings) -> bool:
+        delete_key = str(settings.value("delete_shortcut", "DELETE")).strip().upper()
+        special_map = {
+            "DELETE": Qt.Key.Key_Delete,
+            "BACKSPACE": Qt.Key.Key_Backspace,
+            "SPACE": Qt.Key.Key_Space,
+            "TAB": Qt.Key.Key_Tab,
+        }
+        if delete_key in special_map:
+            return event.key() == special_map[delete_key]
+        return bool(delete_key) and event.text().upper() == delete_key
     
     def check_annotation_selection(self, pos: QPoint):
         """检查是否选中了某个标注"""
@@ -2307,6 +2467,9 @@ class AnnotationCanvas(QFrame):
 
 class AnnotatePage(QWidget):
     """标注页面"""
+
+    # 项目类别在标注页发生增/删/改时发出，通知AI标注页同步标签名
+    classes_changed = pyqtSignal(dict)
     
     def __init__(self):
         super().__init__()
@@ -2336,8 +2499,11 @@ class AnnotatePage(QWidget):
         self.sam_memory_dialog = None
         self.prev_image_shortcut = None
         self.next_image_shortcut = None
+        self._auto_save_timer = QTimer(self)
+        self._auto_save_timer.timeout.connect(self._on_auto_save_tick)
         
         self.init_ui()
+        self.apply_user_settings()
     
     def init_ui(self):
         """初始化界面"""
@@ -2375,9 +2541,45 @@ class AnnotatePage(QWidget):
         self._init_navigation_shortcuts()
 
     def showEvent(self, event):
-        """显示页面时刷新快捷键配置。"""
-        self._refresh_navigation_shortcuts()
+        """显示页面时刷新快捷键与自动保存配置。"""
+        self.apply_user_settings()
         super().showEvent(event)
+
+    def apply_user_settings(self):
+        """同步偏好设置中的快捷键和自动保存配置。"""
+        from PyQt6.QtCore import QSettings
+
+        self._refresh_navigation_shortcuts()
+        settings = QSettings("Better-YOLO", "Settings")
+        enabled = settings.value("auto_save_enabled", True, type=bool)
+        try:
+            interval_min = max(1, int(settings.value("auto_save_interval", 5)))
+        except (TypeError, ValueError):
+            interval_min = 5
+
+        if enabled:
+            self._auto_save_timer.start(interval_min * 60 * 1000)
+        else:
+            self._auto_save_timer.stop()
+
+    def _on_auto_save_tick(self):
+        """定时自动保存当前打开图片的标注状态。"""
+        if not self.current_project_id or not self.current_image_id or not self.annotations:
+            return
+        saved = 0
+        for ann in self.annotations:
+            try:
+                db.update_annotation(
+                    ann['id'],
+                    data=ann.get('data', {}).copy(),
+                    class_id=ann.get('class_id'),
+                    class_name=ann.get('class_name'),
+                )
+                saved += 1
+            except Exception:
+                pass
+        if saved:
+            self.show_save_feedback(f"已自动保存 ({saved})")
 
     def _init_navigation_shortcuts(self):
         """初始化翻页快捷键，避免依赖控件焦点。"""
@@ -2592,7 +2794,7 @@ class AnnotatePage(QWidget):
         # 删除按钮（主动作删标注，下拉菜单删图片）
         self.btn_delete = QToolButton()
         self.btn_delete.setText("🗑️ 删除")
-        self.btn_delete.setToolTip("删除当前选中标注\n快捷键: D")
+        self.btn_delete.setToolTip("删除当前选中标注\n快捷键: Delete")
         self.btn_delete.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.btn_delete.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.btn_delete.setStyleSheet(self._toolbar_chip_style('danger'))
@@ -3169,19 +3371,14 @@ class AnnotatePage(QWidget):
                     classes = []
                     
                     if project:
-                        # 加载类别
+                        # 加载类别（默认不预设任何类别）
                         import json
                         try:
                             classes = json.loads(project.get('classes', '[]'))
-                        except:
+                            if not isinstance(classes, list):
+                                classes = []
+                        except Exception:
                             classes = []
-                        
-                        if not classes:
-                            # 添加默认类别
-                            classes = [
-                                {'id': 0, 'name': 'person', 'color': '#FF0000'},
-                                {'id': 1, 'name': 'car', 'color': '#00FF00'}
-                            ]
                     
                     # 加载图片列表数据
                     images = db.get_project_images(self.project_id)
@@ -3331,11 +3528,14 @@ class AnnotatePage(QWidget):
         self.sample_target_class.blockSignals(True)
         self.sample_target_class.clear()
         
-        # 更新canvas的类别颜色
+        # 更新canvas的类别颜色与类别名称（画布显示标签用）
         class_colors = {}
+        class_names = {}
         for cls in self.classes:
             class_colors[cls['id']] = cls.get('color', '#808080')
+            class_names[cls['id']] = cls.get('name', '')
         self.canvas.class_colors = class_colors
+        self.canvas.class_names = class_names
         
         for cls in self.classes:
             sample_count = class_sample_counts.get(cls['id'], 0)
@@ -3380,6 +3580,7 @@ class AnnotatePage(QWidget):
             )
             self.class_list.setCurrentRow(selected_row)
             self.on_class_selected()
+        self.canvas.update()
 
     def get_sample_target_images(self, target_class_id):
         """获取指定标签对应的样本图像列表"""
@@ -3630,11 +3831,12 @@ class AnnotatePage(QWidget):
                     self.classes = new_classes
                     # 更新数据库
                     db.update_project(self.current_project_id, classes=self.classes)
-                    # 更新界面
+                    # 更新界面并通知AI标注页同步标签
                     self.update_class_list()
+                    self.classes_changed.emit({'action': 'sync'})
                     QMessageBox.information(self, "成功", "类别列表已更新")
             self.apply_sam_button_mode()
-    
+
     def start_sam_annotation(self):
         """开始SAM交互式标注"""
         if not self.current_project_id:
@@ -3643,6 +3845,10 @@ class AnnotatePage(QWidget):
         
         if not self.current_image_id:
             QMessageBox.warning(self, "提示", "请先选择一张图片")
+            return
+
+        if not self.classes:
+            QMessageBox.information(self, "提示", "当前项目暂无类别，请先在右侧“类别列表”中添加类别后再使用 SAM 标注")
             return
         
         # 获取当前图片路径
@@ -4298,30 +4504,46 @@ class AnnotatePage(QWidget):
             p1x, p1y = p2x, p2y
         return inside
     
+    def _confirm_locked_single_inference(self) -> bool:
+        """若当前图片已人工锁定，单张推理前提示确认，防止误覆盖人工成果"""
+        img = next(
+            (i for i in self.images if i['id'] == self.current_image_id),
+            self.current_image_data,
+        )
+        if img and img.get('locked'):
+            reply = QMessageBox.question(
+                self,
+                "图片已锁定",
+                "当前图片已处于人工锁定状态（🔒）。\n确定仍要对该图片运行 YOLO 自动标注吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return reply == QMessageBox.StandardButton.Yes
+        return True
+
     def run_single_inference(self):
         """运行单张图像推理"""
         if not self.current_image_data:
             QMessageBox.warning(self, "提示", "请先选择一张图片")
             return
+        if not self._confirm_locked_single_inference():
+            return
         
         # 显示加载动画
         self.show_loading_animation("正在进行单张推理...")
         
-        # 使用保存的参数或默认参数运行推理
         try:
             from core.auto_labeler import AutoLabeler
             
-            # 获取模型参数（优先使用保存的参数）
             if hasattr(self, 'auto_label_settings'):
                 settings = self.auto_label_settings
                 model_path = settings.get('model_path', "yolov8n")
-                model_task = settings.get('model_task', 'detect')  # 获取保存的任务类型
+                model_task = settings.get('model_task', 'detect')
                 conf_threshold = settings.get('conf_threshold', 0.5)
                 iou_threshold = settings.get('iou_threshold', 0.45)
                 class_mapping = settings.get('class_mapping', {})
                 overwrite_labels = settings.get('overwrite_labels', False)
             else:
-                # 默认模型参数
                 model_path = "yolov8n"
                 model_task = 'detect'
                 conf_threshold = 0.5
@@ -4329,168 +4551,10 @@ class AnnotatePage(QWidget):
                 class_mapping = {}
                 overwrite_labels = False
             
-            # 使用process_single_image方法，支持model_task
             labeler = AutoLabeler(model_path, self.model_manager)
             
-            # 加载模型配置
             import re
-            match = re.match(r'(yolov)(\d+)([a-z])', model_path)
-            if match:
-                version_num = match.group(2)
-                size = match.group(3)
-                version = f"YOLOv{version_num}"
-                load_config = {
-                    'model_version': version,
-                    'model_size': size,
-                    'model_source': 'official',
-                    'model_task': model_task,  # 使用保存的任务类型
-                    'class_mappings': class_mapping
-                }
-                labeler.load_model(load_config)
-            else:
-                # 自定义模型
-                if os.path.exists(model_path):
-                    # 对于自定义模型，也需要设置model_task
-                    load_config = {
-                        'model_version': '',  # 自定义模型不需要版本
-                        'model_size': '',  # 自定义模型不需要大小
-                        'model_source': 'custom',
-                        'model_task': model_task,  # 使用保存的任务类型
-                        'custom_model_path': model_path,
-                        'class_mappings': class_mapping
-                    }
-                    labeler.load_model(load_config)
-            
-            # 处理图像
-            config = {
-                'conf_threshold': conf_threshold,
-                'iou_threshold': iou_threshold,
-                'class_mappings': class_mapping
-            }
-            annotations = labeler.process_single_image(
-                self.current_image_data['storage_path'], 
-                self.current_image_id,
-                config
-            )
-            
-            # 更新当前图像的标注
-            if annotations and self.current_image_id:
-                # 保存标注到数据库
-                # 如果需要覆盖原标签，先删除所有原标注
-                if overwrite_labels:
-                    db.delete_image_annotations(self.current_image_id)
-                
-                for annotation in annotations:
-                    # 获取类别名称
-                    class_id = annotation['class_id']
-                    
-                    # 检查类别ID是否在项目类别范围内
-                    existing_class = next((cls for cls in self.classes if cls['id'] == class_id), None)
-                    if existing_class:
-                        class_name = existing_class['name']
-                    else:
-                        # 创建新类别
-                        class_name = f"class_{class_id}"
-                        # 生成随机颜色
-                        import random
-                        color = f"#{random.randint(0, 0xFFFFFF):06x}"
-                        new_class = {
-                            'id': class_id,
-                            'name': class_name,
-                            'color': color
-                        }
-                        self.classes.append(new_class)
-                        # 更新项目类别
-                        db.update_project(self.current_project_id, classes=self.classes)
-                    
-                    # 保存标注
-                    db.add_annotation(
-                        self.current_image_id,
-                        self.current_project_id,
-                        class_id,
-                        class_name,
-                        annotation['type'],
-                        annotation['data']
-                    )
-                
-                # 重新加载当前图像的标注
-                self.load_current_image_annotations()
-                
-                QMessageBox.information(self, "成功", "自动标注完成！")
-            else:
-                # 如果没有检测到目标，但需要覆盖原标签，也删除原标注
-                if overwrite_labels and self.current_image_id:
-                    db.delete_image_annotations(self.current_image_id)
-                    self.load_current_image_annotations()
-                QMessageBox.information(self, "提示", "未检测到目标")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"自动标注失败: {str(e)}")
-        finally:
-            # 隐藏加载动画
-            self.hide_loading_animation()
-    
-    def run_batch_inference(self):
-        """运行批量推理"""
-        if not self.current_project_id or len(self.images) == 0:
-            QMessageBox.warning(self, "提示", "项目中没有图片")
-            return
-        
-        # 显示加载动画
-        self.show_loading_animation("正在进行批量推理...")
-        
-        # 使用保存的参数或默认参数运行批量推理
-        try:
-            # 获取模型参数（优先使用保存的参数）
-            if hasattr(self, 'auto_label_settings'):
-                settings = self.auto_label_settings
-                model_path = settings.get('model_path', "yolov8n")
-                model_task = settings.get('model_task', 'detect')  # 获取保存的任务类型
-                conf_threshold = settings.get('conf_threshold', 0.5)
-                iou_threshold = settings.get('iou_threshold', 0.45)
-                class_mapping = settings.get('class_mapping', {})
-                only_unlabeled = settings.get('only_unlabeled', True)
-            else:
-                # 默认模型参数
-                model_path = "yolov8n"
-                model_task = 'detect'
-                conf_threshold = 0.5
-                iou_threshold = 0.45
-                class_mapping = {}
-                only_unlabeled = True
-            
-            # 过滤图像（如果只处理未标注的）
-            if only_unlabeled:
-                # 更宽松的过滤逻辑，包括status为None或空的情况
-                filtered_images = [img for img in self.images if img.get('status') not in ['annotated', 'completed']]
-            else:
-                filtered_images = self.images
-            
-            if not filtered_images:
-                QMessageBox.warning(self, "提示", f"没有符合条件的图片\n总图片数: {len(self.images)}\n未标注图片数: {len([img for img in self.images if img.get('status') not in ['annotated', 'completed']])}")
-                return
-            
-            # 开始批量处理，传递model_task
-            self.batch_labeling_manager.start_batch_processing(
-                model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager, model_task
-            )
-            
-            # 批量处理是异步的，通过信号处理完成事件
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"批量推理失败: {str(e)}")
-        finally:
-            # 隐藏加载动画
-            self.hide_loading_animation()
-    
-    def on_single_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, image_path, model_task='detect'):
-        """单张推理请求回调"""
-        from core.auto_labeler import AutoLabeler
-        
-        try:
-            labeler = AutoLabeler(model_path, self.model_manager)
-            
-            # 加载模型，指定任务类型
-            import re
-            match = re.match(r'(yolov)(\d+)([a-z])', model_path)
+            match = re.match(r'(yolov?)(\d+)([a-z]+)', model_path, re.I)
             if match:
                 version_num = match.group(2)
                 size = match.group(3)
@@ -4503,12 +4567,152 @@ class AnnotatePage(QWidget):
                     'class_mappings': class_mapping
                 }
                 labeler.load_model(load_config)
-            else:
-                # 自定义模型
-                if os.path.exists(model_path):
-                    labeler.current_model = self.model_manager.load_custom_model(model_path)
+            elif os.path.exists(model_path):
+                load_config = {
+                    'model_version': '',
+                    'model_size': '',
+                    'model_source': 'custom',
+                    'model_task': model_task,
+                    'custom_model_path': model_path,
+                    'class_mappings': class_mapping
+                }
+                labeler.load_model(load_config)
             
-            # 处理图像
+            config = {
+                'conf_threshold': conf_threshold,
+                'iou_threshold': iou_threshold,
+                'class_mappings': class_mapping
+            }
+            annotations = labeler.process_single_image(
+                self.current_image_data['storage_path'], 
+                self.current_image_id,
+                config
+            )
+            
+            if annotations and self.current_image_id:
+                labeler.save_annotations(
+                    annotations,
+                    self.current_image_id,
+                    overwrite=overwrite_labels,
+                    ignore_lock=True,
+                )
+                self.refresh_classes()
+                self.classes_changed.emit({'action': 'sync'})
+                self.load_current_image_annotations()
+                self.update_image_list_display()
+                QMessageBox.information(self, "成功", "自动标注完成！")
+            else:
+                if overwrite_labels and self.current_image_id:
+                    for ann in db.get_image_annotations(self.current_image_id):
+                        if not (ann.get('attributes') or {}).get('locked'):
+                            db.delete_annotation(ann['id'])
+                    self.load_current_image_annotations()
+                QMessageBox.information(self, "提示", "未检测到目标")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"自动标注失败: {str(e)}")
+        finally:
+            self.hide_loading_animation()
+    
+    def run_batch_inference(self):
+        """运行批量推理"""
+        if not self.current_project_id or len(self.images) == 0:
+            QMessageBox.warning(self, "提示", "项目中没有图片")
+            return
+        
+        self.show_loading_animation("正在进行批量推理...")
+        
+        try:
+            if hasattr(self, 'auto_label_settings'):
+                settings = self.auto_label_settings
+                model_path = settings.get('model_path', "yolov8n")
+                model_task = settings.get('model_task', 'detect')
+                conf_threshold = settings.get('conf_threshold', 0.5)
+                iou_threshold = settings.get('iou_threshold', 0.45)
+                class_mapping = settings.get('class_mapping', {})
+                only_unlabeled = settings.get('only_unlabeled', True)
+                overwrite_labels = settings.get('overwrite_labels', False)
+            else:
+                model_path = "yolov8n"
+                model_task = 'detect'
+                conf_threshold = 0.5
+                iou_threshold = 0.45
+                class_mapping = {}
+                only_unlabeled = True
+                overwrite_labels = False
+            
+            if only_unlabeled:
+                candidate_images = [img for img in self.images if img.get('status') not in ['annotated', 'completed']]
+            else:
+                candidate_images = list(self.images)
+
+            if not candidate_images:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    f"没有符合条件的图片\n总图片数: {len(self.images)}\n"
+                    f"未标注图片数: {len([img for img in self.images if img.get('status') not in ['annotated', 'completed']])}"
+                )
+                return
+
+            filtered_images = [img for img in candidate_images if not img.get('locked')]
+            if not filtered_images:
+                QMessageBox.information(
+                    self,
+                    "提示",
+                    f"符合条件的 {len(candidate_images)} 张图片均已人工锁定（🔒），已自动保护跳过。\n如需重新自动标注，请先解锁对应图片。"
+                )
+                return
+            
+            self.batch_labeling_manager.start_batch_processing(
+                model_path,
+                filtered_images,
+                conf_threshold,
+                iou_threshold,
+                class_mapping,
+                self.model_manager,
+                model_task,
+                overwrite_labels=overwrite_labels,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"批量推理失败: {str(e)}")
+        finally:
+            self.hide_loading_animation()
+    
+    def on_single_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, image_path, model_task='detect'):
+        """单张推理请求回调"""
+        from core.auto_labeler import AutoLabeler
+
+        if not self._confirm_locked_single_inference():
+            return
+        
+        try:
+            labeler = AutoLabeler(model_path, self.model_manager)
+            
+            import re
+            match = re.match(r'(yolov?)(\d+)([a-z]+)', model_path, re.I)
+            if match:
+                version_num = match.group(2)
+                size = match.group(3)
+                version = f"YOLOv{version_num}"
+                load_config = {
+                    'model_version': version,
+                    'model_size': size,
+                    'model_source': 'official',
+                    'model_task': model_task,
+                    'class_mappings': class_mapping
+                }
+                labeler.load_model(load_config)
+            elif os.path.exists(model_path):
+                load_config = {
+                    'model_version': '',
+                    'model_size': '',
+                    'model_source': 'custom',
+                    'model_task': model_task,
+                    'custom_model_path': model_path,
+                    'class_mappings': class_mapping
+                }
+                labeler.load_model(load_config)
+            
             config = {
                 'conf_threshold': conf_threshold,
                 'iou_threshold': iou_threshold,
@@ -4516,59 +4720,27 @@ class AnnotatePage(QWidget):
             }
             annotations = labeler.process_single_image(image_path, self.current_image_id, config)
             
-            # 获取覆盖标签设置
             overwrite_labels = False
             if hasattr(self, 'auto_label_settings'):
                 overwrite_labels = self.auto_label_settings.get('overwrite_labels', False)
             
-            # 更新当前图像的标注
             if annotations and self.current_image_id:
-                # 保存标注到数据库
-                # 如果需要覆盖原标签，先删除所有原标注
-                if overwrite_labels:
-                    db.delete_image_annotations(self.current_image_id)
-                
-                for annotation in annotations:
-                    # 获取类别名称
-                    class_id = annotation['class_id']
-                    
-                    # 检查类别ID是否在项目类别范围内
-                    existing_class = next((cls for cls in self.classes if cls['id'] == class_id), None)
-                    if existing_class:
-                        class_name = existing_class['name']
-                    else:
-                        # 创建新类别
-                        class_name = f"class_{class_id}"
-                        # 生成随机颜色
-                        import random
-                        color = f"#{random.randint(0, 0xFFFFFF):06x}"
-                        new_class = {
-                            'id': class_id,
-                            'name': class_name,
-                            'color': color
-                        }
-                        self.classes.append(new_class)
-                        # 更新项目类别
-                        db.update_project(self.current_project_id, classes=self.classes)
-                    
-                    # 保存标注
-                    db.add_annotation(
-                        self.current_image_id,
-                        self.current_project_id,
-                        class_id,
-                        class_name,
-                        annotation['type'],
-                        annotation['data']
-                    )
-                
-                # 重新加载当前图像的标注
+                labeler.save_annotations(
+                    annotations,
+                    self.current_image_id,
+                    overwrite=overwrite_labels,
+                    ignore_lock=True,
+                )
+                self.refresh_classes()
+                self.classes_changed.emit({'action': 'sync'})
                 self.load_current_image_annotations()
-                
+                self.update_image_list_display()
                 QMessageBox.information(self, "成功", "自动标注完成！")
             else:
-                # 如果没有检测到目标，但需要覆盖原标签，也删除原标注
                 if overwrite_labels and self.current_image_id:
-                    db.delete_image_annotations(self.current_image_id)
+                    for ann in db.get_image_annotations(self.current_image_id):
+                        if not (ann.get('attributes') or {}).get('locked'):
+                            db.delete_annotation(ann['id'])
                     self.load_current_image_annotations()
                 QMessageBox.information(self, "提示", "未检测到目标")
         except Exception as e:
@@ -4576,19 +4748,35 @@ class AnnotatePage(QWidget):
     
     def on_batch_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, images, only_unlabeled, model_task='detect'):
         """批量推理请求回调"""
-        # 过滤图像（如果只处理未标注的）
         if only_unlabeled:
-            filtered_images = [img for img in images if img.get('status') != 'annotated']
+            candidate_images = [img for img in images if img.get('status') != 'annotated']
         else:
-            filtered_images = images
+            candidate_images = list(images)
         
-        if not filtered_images:
+        if not candidate_images:
             QMessageBox.warning(self, "提示", "没有符合条件的图片")
             return
+
+        filtered_images = [img for img in candidate_images if not img.get('locked')]
+        if not filtered_images:
+            QMessageBox.information(self, "提示", "符合条件的图片均已人工锁定（🔒），已自动保护跳过。")
+            return
+
+        overwrite_labels = False
+        if hasattr(self, 'auto_label_settings'):
+            overwrite_labels = self.auto_label_settings.get('overwrite_labels', False)
+        elif self.auto_label_dialog is not None:
+            overwrite_labels = self.auto_label_dialog.chk_overwrite.isChecked()
         
-        # 开始批量处理
         self.batch_labeling_manager.start_batch_processing(
-            model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager, model_task
+            model_path,
+            filtered_images,
+            conf_threshold,
+            iou_threshold,
+            class_mapping,
+            self.model_manager,
+            model_task,
+            overwrite_labels=overwrite_labels,
         )
     
     def on_batch_inference_progress(self, progress, current, total, image_name):
@@ -4600,16 +4788,16 @@ class AnnotatePage(QWidget):
     
     def on_batch_inference_completed(self, success, message, processed_count):
         """批量推理完成回调"""
+        self.refresh_classes()
+        self.classes_changed.emit({'action': 'sync'})
+        self.load_image_list()
+        self.load_current_image_annotations()
+        self.update_status_bar()
+
         if success:
-            QMessageBox.information(self, "成功", f"批量自动标注完成！\n处理了 {processed_count} 张图片")
+            QMessageBox.information(self, "成功", message or f"批量自动标注完成！\n处理了 {processed_count} 张图片")
         else:
             QMessageBox.critical(self, "错误", f"批量自动标注失败: {message}")
-        
-        # 重新加载图片列表以更新状态
-        self.load_image_list()
-        
-        # 重置状态栏
-        self.update_status_bar()
     
     def load_current_image_annotations(self):
         """加载当前图像的标注"""
@@ -4893,10 +5081,36 @@ class AnnotatePage(QWidget):
         """标注创建事件"""
         if not self.current_image_id or not self.current_project_id:
             return
-        
-        # 从标注数据中获取类别ID（由画布传递）
-        class_id = annotation.get('class_id', self.current_class_id)
-        class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
+
+        # 当前项目尚未添加任何类别时，引导用户输入首个类别名称，避免写入无效 unknown 类别
+        if not self.classes:
+            name, ok = QInputDialog.getText(
+                self, "添加类别", "当前项目暂无标注类别，请输入首个类别名称:"
+            )
+            name = (name or "").strip()
+            if not ok or not name:
+                self.canvas.update()
+                return
+            self.classes.append({
+                'id': 0,
+                'name': name,
+                'color': '#EF4444',
+            })
+            db.update_project(self.current_project_id, classes=self.classes)
+            self.current_class_id = 0
+            self.canvas.current_class_id = 0
+            self.update_class_list()
+            self.classes_changed.emit({'action': 'add', 'name': name})
+            class_id = 0
+            class_name = name
+        else:
+            # 从标注数据中获取类别ID（由画布传递）
+            class_id = annotation.get('class_id', self.current_class_id)
+            matched_cls = next((c for c in self.classes if c.get('id') == class_id), None)
+            if matched_cls is None:
+                matched_cls = self.classes[0]
+                class_id = matched_cls['id']
+            class_name = matched_cls['name']
         
         # 保存到数据库
         ann_id = db.add_annotation(
@@ -5395,13 +5609,19 @@ class AnnotatePage(QWidget):
         if not class_info:
             return
         
+        old_name = class_info['name']
+        
         # 编辑名称
         name, ok = QInputDialog.getText(
             self, "编辑类别", 
             "请输入类别名称:",
-            text=class_info['name']
+            text=old_name
         )
+        name = (name or "").strip()
         if not ok or not name:
+            return
+        if any(c.get('name') == name and c.get('id') != class_id for c in self.classes):
+            QMessageBox.warning(self, "提示", f"类别名称 '{name}' 已存在")
             return
         
         # 编辑颜色
@@ -5416,11 +5636,20 @@ class AnnotatePage(QWidget):
         class_info['name'] = name
         class_info['color'] = color.name()
         
-        # 保存到数据库
+        # 保存到数据库并同步已有标注名称
         db.update_project(self.current_project_id, classes=self.classes)
+        if old_name != name and self.current_project_id:
+            db.rename_project_class_annotations(self.current_project_id, class_id, name)
         
-        # 更新显示
+        # 更新显示并通知AI标注页同步标签名
         self.update_class_list()
+        self.load_annotations()
+        if old_name != name:
+            self.classes_changed.emit({
+                'action': 'rename',
+                'old_name': old_name,
+                'new_name': name,
+            })
     
     def delete_class(self, item: QListWidgetItem):
         """删除类别"""
@@ -5429,43 +5658,52 @@ class AnnotatePage(QWidget):
         if not class_info:
             return
         
+        deleted_name = class_info['name']
+        
         # 确认删除
         reply = QMessageBox.question(
             self, "确认删除",
-            f"确定要删除类别 '{class_info['name']}' 吗？\n该类别下的所有标注将被删除！",
+            f"确定要删除类别 '{deleted_name}' 吗？\n该类别下的所有标注将被删除！",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        # 删除该类别下的所有标注
-        for annotation in self.annotations:
-            if annotation.get('class_id') == class_id:
-                db.delete_annotation(annotation['id'])
+        # 删除项目内该类别下的全部标注并重排后续 class_id
+        if self.current_project_id:
+            db.delete_project_class_and_reindex(self.current_project_id, class_id)
 
-        # 手动批量删除 = 整张图锁定
-        self._mark_image_modified()
+        # 若当前图曾包含该类标注，视为手动修改并锁定本图
+        if any(ann.get('class_id') == class_id for ann in self.annotations):
+            self._mark_image_modified()
 
-        # 从列表中删除类别
+        # 从列表中删除类别并重新编号
         self.classes = [c for c in self.classes if c['id'] != class_id]
-        
-        # 重新编号
         for i, cls in enumerate(self.classes):
             cls['id'] = i
         
         # 保存到数据库
         db.update_project(self.current_project_id, classes=self.classes)
         
-        # 更新显示
+        # 更新显示并通知AI标注页同步删除
         self._invalidate_sample_stats_cache()
         self.update_class_list()
         self.load_annotations()
+        self.classes_changed.emit({'action': 'delete', 'name': deleted_name})
     
     def add_class(self):
         """添加类别"""
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
         name, ok = QInputDialog.getText(self, "添加类别", "请输入类别名称:")
+        name = (name or "").strip()
         if ok and name:
+            if any(c.get('name') == name for c in self.classes):
+                QMessageBox.warning(self, "提示", f"类别名称 '{name}' 已存在")
+                return
+
             # 选择颜色
             color = QColorDialog.getColor(QColor(255, 0, 0), self, "选择类别颜色")
             if not color.isValid():
@@ -5485,6 +5723,8 @@ class AnnotatePage(QWidget):
             # 选中新添加的类别
             self.class_list.setCurrentRow(self.class_list.count() - 1)
             self.on_class_selected()
+            # 通知AI标注页同步新增标签（描述留空）
+            self.classes_changed.emit({'action': 'add', 'name': name})
     
     def prev_image(self):
         """上一张图片"""
@@ -5594,8 +5834,9 @@ class AnnotatePage(QWidget):
             self.btn_move.setChecked(True)
             self.set_tool('move')
             return
-        elif key_text == delete_key:
+        elif AnnotationCanvas._matches_delete_shortcut(event, settings):
             self.delete_selected_annotation()
+            return
         elif event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Z:
             self.undo()
         else:
@@ -5608,16 +5849,202 @@ class AnnotatePage(QWidget):
                     return
             super().keyPressEvent(event)
     
+    @staticmethod
+    def _extract_xy_points(raw_points) -> List[Tuple[float, float]]:
+        """兼容 [{'x':..,'y':..}] 与 [(x, y)] 两种多边形顶点格式"""
+        extracted = []
+        for point in raw_points or []:
+            if isinstance(point, dict) and 'x' in point and 'y' in point:
+                extracted.append((float(point['x']), float(point['y'])))
+            elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                extracted.append((float(point[0]), float(point[1])))
+        return extracted
+
+    @classmethod
+    def _format_yolo_annotation_lines(
+        cls,
+        annotations: List[Dict],
+        img_width: int,
+        img_height: int,
+    ) -> List[str]:
+        """将单张图的标注列表序列化为标准 YOLO 文本行（兼容 bbox / polygon / keypoint / obb）"""
+        w_img = max(1, int(img_width or 1920))
+        h_img = max(1, int(img_height or 1080))
+        lines = []
+
+        for ann in annotations:
+            class_id = ann.get('class_id', 0)
+            ann_type = ann.get('type', 'bbox')
+            data = ann.get('data', {}) or {}
+
+            if ann_type == 'bbox':
+                x = float(data.get('x', 0))
+                y = float(data.get('y', 0))
+                width = float(data.get('width', 0))
+                height = float(data.get('height', 0))
+
+                x_center = (x + width / 2.0) / w_img
+                y_center = (y + height / 2.0) / h_img
+                norm_width = width / w_img
+                norm_height = height / h_img
+                lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}")
+
+            elif ann_type in ('polygon', 'mask'):
+                raw_pts = data.get('points') if 'points' in data else data.get('mask', [])
+                pts = cls._extract_xy_points(raw_pts)
+                if len(pts) >= 3:
+                    coords = [
+                        f"{px / w_img:.6f} {py / h_img:.6f}"
+                        for px, py in pts
+                    ]
+                    lines.append(f"{class_id} {' '.join(coords)}")
+
+            elif ann_type == 'keypoint':
+                x = float(data.get('x', 0))
+                y = float(data.get('y', 0))
+                width = float(data.get('width', 0))
+                height = float(data.get('height', 0))
+                keypoints = data.get('keypoints', []) or []
+
+                x_center = (x + width / 2.0) / w_img
+                y_center = (y + height / 2.0) / h_img
+                norm_width = width / w_img
+                norm_height = height / h_img
+                kp_tokens = []
+                for kp in keypoints:
+                    kp_x = float(kp.get('x', 0)) / w_img
+                    kp_y = float(kp.get('y', 0)) / h_img
+                    kp_v = kp.get('v', kp.get('visible', 1))
+                    kp_tokens.append(f"{kp_x:.6f} {kp_y:.6f} {kp_v}")
+                suffix = (" " + " ".join(kp_tokens)) if kp_tokens else ""
+                lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}{suffix}")
+
+            elif ann_type == 'obb':
+                pts = cls._extract_xy_points(data.get('points', []))
+                if len(pts) == 4:
+                    coords = [f"{px / w_img:.6f} {py / h_img:.6f}" for px, py in pts]
+                    lines.append(f"{class_id} {' '.join(coords)}")
+                else:
+                    x = float(data.get('x', 0))
+                    y = float(data.get('y', 0))
+                    width = float(data.get('width', 0))
+                    height = float(data.get('height', 0))
+                    angle = float(data.get('angle', 0))
+                    x_center = (x + width / 2.0) / w_img
+                    y_center = (y + height / 2.0) / h_img
+                    lines.append(
+                        f"{class_id} {x_center:.6f} {y_center:.6f} {width / w_img:.6f} {height / h_img:.6f} {angle:.6f}"
+                    )
+
+        return lines
+
+    @staticmethod
+    def _polygon_area(pts: List[Tuple[float, float]]) -> float:
+        """鞋带公式计算多边形面积"""
+        if len(pts) < 3:
+            return 0.0
+        area = 0.0
+        n = len(pts)
+        for i in range(n):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            area += x1 * y2 - x2 * y1
+        return abs(area) * 0.5
+
+    def _build_coco_export_dict(self, project_name: str, images: List[Dict]) -> Dict:
+        """构建标准 COCO 格式导出字典（同时兼容 bbox 与 polygon 分割标注）"""
+        from datetime import datetime
+        coco_data = {
+            "info": {
+                "description": f"Annotations for {project_name}",
+                "version": "1.0",
+                "year": datetime.now().year,
+            },
+            "licenses": [],
+            "images": [],
+            "annotations": [],
+            "categories": [],
+        }
+
+        for cls in sorted(self.classes, key=lambda c: c['id']):
+            coco_data["categories"].append({
+                "id": cls['id'],
+                "name": cls['name'],
+                "supercategory": "object",
+            })
+
+        annotation_id = 1
+        for image in images:
+            coco_data["images"].append({
+                "id": image['id'],
+                "file_name": image['filename'],
+                "width": image.get('width') or 1920,
+                "height": image.get('height') or 1080,
+                "date_captured": "",
+                "license": 0,
+                "coco_url": "",
+                "flickr_url": "",
+            })
+
+            annotations = db.get_image_annotations(image['id'])
+            for ann in annotations:
+                ann_type = ann.get('type', 'bbox')
+                data = ann.get('data', {}) or {}
+                category_id = ann.get('class_id', 0)
+
+                if ann_type == 'bbox':
+                    x = round(float(data.get('x', 0)), 2)
+                    y = round(float(data.get('y', 0)), 2)
+                    width = round(float(data.get('width', 0)), 2)
+                    height = round(float(data.get('height', 0)), 2)
+                    coco_data["annotations"].append({
+                        "id": annotation_id,
+                        "image_id": image['id'],
+                        "category_id": category_id,
+                        "segmentation": [],
+                        "area": round(width * height, 2),
+                        "bbox": [x, y, width, height],
+                        "iscrowd": 0,
+                    })
+                    annotation_id += 1
+
+                elif ann_type in ('polygon', 'mask'):
+                    raw_pts = data.get('points') if 'points' in data else data.get('mask', [])
+                    pts = self._extract_xy_points(raw_pts)
+                    if len(pts) >= 3:
+                        xs = [p[0] for p in pts]
+                        ys = [p[1] for p in pts]
+                        min_x, max_x = min(xs), max(xs)
+                        min_y, max_y = min(ys), max(ys)
+                        bbox = [
+                            round(min_x, 2),
+                            round(min_y, 2),
+                            round(max_x - min_x, 2),
+                            round(max_y - min_y, 2),
+                        ]
+                        flat_seg = [round(coord, 2) for pt in pts for coord in pt]
+                        coco_data["annotations"].append({
+                            "id": annotation_id,
+                            "image_id": image['id'],
+                            "category_id": category_id,
+                            "segmentation": [flat_seg],
+                            "area": round(self._polygon_area(pts), 2),
+                            "bbox": bbox,
+                            "iscrowd": 0,
+                        })
+                        annotation_id += 1
+
+        return coco_data
+
     def export_annotations(self):
         """导出标注文件"""
-        import shutil
+        import json
         from PyQt6.QtWidgets import QMessageBox, QFileDialog
         
         if not self.current_project_id:
             QMessageBox.warning(self, "导出失败", "请先选择一个项目")
             return
         
-        # 选择导出目录
         export_dir = QFileDialog.getExistingDirectory(
             self, "选择导出目录", 
             os.path.expanduser("~")
@@ -5627,36 +6054,25 @@ class AnnotatePage(QWidget):
             return
         
         try:
-            # 获取导出格式
             export_format = self.export_format.currentText()
-            
-            # 获取项目信息
             project = db.get_project(self.current_project_id)
             if not project:
                 QMessageBox.warning(self, "导出失败", "无法获取项目信息")
                 return
             
             project_name = project.get('name', 'untitled')
-            
-            # 创建导出目录结构
             export_path = os.path.join(export_dir, f"{project_name}_annotations")
             os.makedirs(export_path, exist_ok=True)
             
-            # 获取项目图片
             images = db.get_project_images(self.current_project_id)
             if not images:
                 QMessageBox.warning(self, "导出失败", "项目中没有图片")
                 return
             
-            # 获取类别映射
-            class_mapping = {cls['id']: cls['name'] for cls in self.classes}
-            
             if export_format == "YOLO格式":
-                # 创建labels目录
                 labels_dir = os.path.join(export_path, 'labels')
                 os.makedirs(labels_dir, exist_ok=True)
                 
-                # 导出每个图片的标注
                 exported_count = 0
                 negative_count = 0
                 for image in images:
@@ -5665,60 +6081,21 @@ class AnnotatePage(QWidget):
                     image_status = image.get('status', 'pending')
                     
                     if annotations or image_status == 'annotated':
-                        # 已标注图片都应生成标签文件；负样本生成空txt
                         filename = os.path.splitext(image['filename'])[0] + '.txt'
                         label_file = os.path.join(labels_dir, filename)
-                        
+                        lines = self._format_yolo_annotation_lines(
+                            annotations,
+                            image.get('width', 1920),
+                            image.get('height', 1080),
+                        )
                         with open(label_file, 'w', encoding='utf-8') as f:
-                            for ann in annotations:
-                                class_id = ann.get('class_id', 0)
-                                ann_type = ann.get('type', 'bbox')
-                                data = ann.get('data', {})
-                                
-                                if ann_type == 'bbox':
-                                    # YOLO格式：class_id x_center y_center width height
-                                    x = data.get('x', 0)
-                                    y = data.get('y', 0)
-                                    width = data.get('width', 0)
-                                    height = data.get('height', 0)
-
-                                    # 计算中心点和归一化
-                                    img_width = image.get('width', 1920)  # 默认宽度
-                                    img_height = image.get('height', 1080)  # 默认高度
-
-                                    x_center = (x + width/2) / img_width
-                                    y_center = (y + height/2) / img_height
-                                    norm_width = width / img_width
-                                    norm_height = height / img_height
-
-                                    # 写入文件
-                                    f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
-                                elif ann_type == 'mask':
-                                    # YOLO分割格式：class_id x1 y1 x2 y2 ... xn yn
-                                    mask = data.get('mask', [])
-                                    if mask:
-                                        # 计算归一化
-                                        img_width = image.get('width', 1920)  # 默认宽度
-                                        img_height = image.get('height', 1080)  # 默认高度
-
-                                        # 构建归一化的多边形坐标
-                                        normalized_points = []
-                                        for point in mask:
-                                            if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                                x, y = point[0], point[1]
-                                                norm_x = x / img_width
-                                                norm_y = y / img_height
-                                                normalized_points.extend([f"{norm_x:.6f}", f"{norm_y:.6f}"])
-
-                                        if normalized_points:
-                                            # 写入文件
-                                            f.write(f"{class_id} {' '.join(normalized_points)}\n")
+                            for line in lines:
+                                f.write(line + '\n')
                         
                         exported_count += 1
                         if not annotations:
                             negative_count += 1
                 
-                # 创建classes.txt文件
                 classes_file = os.path.join(export_path, 'classes.txt')
                 with open(classes_file, 'w', encoding='utf-8') as f:
                     for cls in sorted(self.classes, key=lambda x: x['id']):
@@ -5732,83 +6109,23 @@ class AnnotatePage(QWidget):
                 )
                 
             elif export_format == "COCO格式":
-                # 导出COCO格式
-                import json
-                
-                # 创建COCO格式的标注数据
-                coco_data = {
-                    "info": {
-                        "description": f"Annotations for {project_name}",
-                        "version": "1.0",
-                        "year": 2024
-                    },
-                    "licenses": [],
-                    "images": [],
-                    "annotations": [],
-                    "categories": []
-                }
-                
-                # 添加类别
-                for cls in self.classes:
-                    coco_data["categories"].append({
-                        "id": cls['id'],
-                        "name": cls['name'],
-                        "supercategory": "object"
-                    })
-                
-                # 添加图片和标注
-                annotation_id = 1
-                for image in images:
-                    # 添加图片信息
-                    image_info = {
-                        "id": image['id'],
-                        "file_name": image['filename'],
-                        "width": image.get('width', 1920),
-                        "height": image.get('height', 1080),
-                        "date_captured": "",
-                        "license": 0,
-                        "coco_url": "",
-                        "flickr_url": ""
-                    }
-                    coco_data["images"].append(image_info)
-                    
-                    # 添加标注
-                    annotations = db.get_image_annotations(image['id'])
-                    for ann in annotations:
-                        ann_type = ann.get('type', 'bbox')
-                        data = ann.get('data', {})
-                        
-                        if ann_type == 'bbox':
-                            # COCO格式：x y width height
-                            x = int(data.get('x', 0))
-                            y = int(data.get('y', 0))
-                            width = int(data.get('width', 0))
-                            height = int(data.get('height', 0))
-                            
-                            coco_annotation = {
-                                "id": annotation_id,
-                                "image_id": image['id'],
-                                "category_id": ann.get('class_id', 0),
-                                "segmentation": [],
-                                "area": width * height,
-                                "bbox": [x, y, width, height],
-                                "iscrowd": 0
-                            }
-                            coco_data["annotations"].append(coco_annotation)
-                            annotation_id += 1
-                
-                # 保存COCO格式文件
+                coco_data = self._build_coco_export_dict(project_name, images)
                 coco_file = os.path.join(export_path, 'annotations.json')
                 with open(coco_file, 'w', encoding='utf-8') as f:
                     json.dump(coco_data, f, indent=2, ensure_ascii=False)
                 
-                QMessageBox.information(self, "导出成功", f"已导出 COCO 格式标注到\n{coco_file}")
+                QMessageBox.information(
+                    self,
+                    "导出成功",
+                    f"已导出 COCO 格式标注（共 {len(coco_data['annotations'])} 条）到\n{coco_file}"
+                )
                 
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出过程中出错:\n{str(e)}")
     
     def export_dataset(self):
-        """导出完整数据集"""
+        """导出完整数据集（根据下拉框所选格式导出 YOLO 或 COCO 数据集）"""
+        import json
         import shutil
         from PyQt6.QtWidgets import QMessageBox, QFileDialog
         
@@ -5816,7 +6133,6 @@ class AnnotatePage(QWidget):
             QMessageBox.warning(self, "导出失败", "请先选择一个项目")
             return
         
-        # 选择导出目录
         export_dir = QFileDialog.getExistingDirectory(
             self, "选择导出目录", 
             os.path.expanduser("~")
@@ -5826,139 +6142,100 @@ class AnnotatePage(QWidget):
             return
         
         try:
-            # 获取导出格式
             export_format = self.export_format.currentText()
-            
-            # 获取项目信息
             project = db.get_project(self.current_project_id)
             if not project:
                 QMessageBox.warning(self, "导出失败", "无法获取项目信息")
                 return
             
             project_name = project.get('name', 'untitled')
-            
-            # 创建导出目录结构
             dataset_dir = os.path.join(export_dir, project_name)
             os.makedirs(dataset_dir, exist_ok=True)
             
-            # 创建images和labels目录
             images_dir = os.path.join(dataset_dir, 'images')
-            labels_dir = os.path.join(dataset_dir, 'labels')
             os.makedirs(images_dir, exist_ok=True)
-            os.makedirs(labels_dir, exist_ok=True)
             
-            # 获取项目图片
             images = db.get_project_images(self.current_project_id)
             if not images:
                 QMessageBox.warning(self, "导出失败", "项目中没有图片")
                 return
             
-            # 获取类别映射
-            class_mapping = {cls['id']: cls['name'] for cls in self.classes}
-            
-            # 复制图片并导出标注
             copied_count = 0
-            exported_count = 0
-            negative_count = 0
-            
             for image in images:
-                # 复制图片
                 src_image = image.get('storage_path', '')
                 if src_image and os.path.exists(src_image):
                     dst_image = os.path.join(images_dir, image['filename'])
                     shutil.copy2(src_image, dst_image)
                     copied_count += 1
-                
-                # 导出标注
+
+            if export_format == "COCO格式":
+                coco_data = self._build_coco_export_dict(project_name, images)
+                coco_file = os.path.join(dataset_dir, 'annotations.json')
+                with open(coco_file, 'w', encoding='utf-8') as f:
+                    json.dump(coco_data, f, indent=2, ensure_ascii=False)
+
+                QMessageBox.information(
+                    self,
+                    "导出成功",
+                    f"已导出 COCO 完整数据集到\n{dataset_dir}\n\n"
+                    f"- 复制图片: {copied_count} 张\n"
+                    f"- 导出标注对象: {len(coco_data['annotations'])} 个"
+                )
+                return
+
+            # YOLO格式数据集导出
+            labels_dir = os.path.join(dataset_dir, 'labels')
+            os.makedirs(labels_dir, exist_ok=True)
+
+            exported_count = 0
+            negative_count = 0
+            for image in images:
                 image_id = image['id']
                 annotations = db.get_image_annotations(image_id)
                 image_status = image.get('status', 'pending')
-                
+
                 if annotations or image_status == 'annotated':
-                    # 已标注图片都应生成标签文件；负样本生成空txt
                     filename = os.path.splitext(image['filename'])[0] + '.txt'
                     label_file = os.path.join(labels_dir, filename)
-                    
+                    lines = self._format_yolo_annotation_lines(
+                        annotations,
+                        image.get('width', 1920),
+                        image.get('height', 1080),
+                    )
                     with open(label_file, 'w', encoding='utf-8') as f:
-                        for ann in annotations:
-                            class_id = ann.get('class_id', 0)
-                            ann_type = ann.get('type', 'bbox')
-                            data = ann.get('data', {})
-                            
-                            # 获取图片尺寸
-                            img_width = image.get('width', 1920)  # 默认宽度
-                            img_height = image.get('height', 1080)  # 默认高度
-                            
-                            if ann_type == 'bbox':
-                                # YOLO格式：class_id x_center y_center width height
-                                x = data.get('x', 0)
-                                y = data.get('y', 0)
-                                width = data.get('width', 0)
-                                height = data.get('height', 0)
-                                
-                                # 计算中心点和归一化
-                                x_center = (x + width/2) / img_width
-                                y_center = (y + height/2) / img_height
-                                norm_width = width / img_width
-                                norm_height = height / img_height
-                                
-                                # 写入文件
-                                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
-                            
-                            elif ann_type == 'polygon':
-                                # YOLO分割格式：class_id x1 y1 x2 y2 ... xn yn
-                                points = data.get('points', [])
-                                if points:
-                                    # 构建归一化的多边形坐标
-                                    normalized_points = []
-                                    for point in points:
-                                        if isinstance(point, dict):
-                                            x = point.get('x', 0)
-                                            y = point.get('y', 0)
-                                        elif isinstance(point, (list, tuple)) and len(point) >= 2:
-                                            x, y = point[0], point[1]
-                                        else:
-                                            continue
-                                        norm_x = x / img_width
-                                        norm_y = y / img_height
-                                        normalized_points.extend([f"{norm_x:.6f}", f"{norm_y:.6f}"])
-                                    
-                                    if normalized_points:
-                                        # 写入文件
-                                        f.write(f"{class_id} {' '.join(normalized_points)}\n")
-                    
+                        for line in lines:
+                            f.write(line + '\n')
+
                     exported_count += 1
                     if not annotations:
                         negative_count += 1
-            
-            # 创建classes.txt文件
-            classes_file = os.path.join(dataset_dir, 'classes.txt')
-            with open(classes_file, 'w', encoding='utf-8') as f:
-                for cls in sorted(self.classes, key=lambda x: x['id']):
-                    f.write(f"{cls['name']}\n")
-            
-            # 创建data.yaml文件（YOLO格式）
-            yaml_file = os.path.join(dataset_dir, 'data.yaml')
-            yaml_content = f"""
-train: images
-test: images
-val: images
 
-nc: {len(self.classes)}
-names: {[cls['name'] for cls in sorted(self.classes, key=lambda x: x['id'])]}
-"""
-            
+            classes_file = os.path.join(dataset_dir, 'classes.txt')
+            sorted_classes = sorted(self.classes, key=lambda x: x['id'])
+            with open(classes_file, 'w', encoding='utf-8') as f:
+                for cls in sorted_classes:
+                    f.write(f"{cls['name']}\n")
+
+            yaml_file = os.path.join(dataset_dir, 'data.yaml')
+            yaml_content = (
+                f"path: {os.path.abspath(dataset_dir)}\n"
+                "train: images\n"
+                "val: images\n"
+                "test: images\n\n"
+                f"nc: {len(sorted_classes)}\n"
+                f"names: {[cls['name'] for cls in sorted_classes]}\n"
+            )
             with open(yaml_file, 'w', encoding='utf-8') as f:
                 f.write(yaml_content)
-            
+
             QMessageBox.information(
                 self,
                 "导出成功",
-                f"已导出完整数据集到\n{dataset_dir}\n\n"
+                f"已导出 YOLO 完整数据集到\n{dataset_dir}\n\n"
                 f"- 复制图片: {copied_count} 张\n"
                 f"- 导出标注: {exported_count} 个\n"
                 f"- 负样本空标签: {negative_count} 个"
             )
-            
+                
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出过程中出错:\n{str(e)}")

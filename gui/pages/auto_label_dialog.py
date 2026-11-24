@@ -725,9 +725,12 @@ class AutoLabelDialog(QDialog):
             model_file = self.cb_sam_model.currentData()
             
             if model_file:
-                # 检查模型文件是否存在
+                # 检查模型文件是否存在（含偏好设置中的预训练模型路径）
+                from core.model_manager import get_pretrained_dir
+                pretrained_dir = str(get_pretrained_dir())
                 model_paths = [
                     model_file,
+                    os.path.join(pretrained_dir, model_file),
                     os.path.join('models', model_file),
                     os.path.join(os.path.expanduser('~'), '.cache', 'ultralytics', model_file),
                 ]
@@ -791,19 +794,37 @@ class AutoLabelDialog(QDialog):
                     self.model_file = model_file
                 
                 def run(self):
+                    from core.model_manager import get_pretrained_dir
+                    import shutil
+                    pretrained_dir = get_pretrained_dir()
+                    target_path = pretrained_dir / self.model_file
+                    original_hub_dir = os.environ.get('YOLO_HUB_DIR')
+                    os.environ['YOLO_HUB_DIR'] = str(pretrained_dir)
                     try:
                         # 根据类型导入正确的类来触发下载
                         if self.sam_type == "FastSAM":
                             from ultralytics import FastSAM
-                            model = FastSAM(self.model_file)
+                            FastSAM(str(target_path) if target_path.exists() else self.model_file)
                         else:
                             # SAM, SAM2, MobileSAM 都使用SAM类
                             from ultralytics import SAM
-                            model = SAM(self.model_file)
-                        
+                            SAM(str(target_path) if target_path.exists() else self.model_file)
+
+                        # 若Ultralytics下载在当前工作目录，归档进预训练模型目录
+                        if not target_path.exists() and os.path.exists(self.model_file):
+                            try:
+                                shutil.move(self.model_file, str(target_path))
+                            except Exception:
+                                pass
+
                         self.download_finished.emit(True, f"模型 {self.model_file} 下载成功")
                     except Exception as e:
                         self.download_finished.emit(False, f"下载失败: {str(e)}")
+                    finally:
+                        if original_hub_dir:
+                            os.environ['YOLO_HUB_DIR'] = original_hub_dir
+                        else:
+                            os.environ.pop('YOLO_HUB_DIR', None)
             
             # 显示进度对话框
             progress = QProgressDialog(f"正在下载模型 {model_file}...", "取消", 0, 0, self)

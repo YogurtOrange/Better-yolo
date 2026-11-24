@@ -73,6 +73,7 @@ class MainWindow(QMainWindow):
         workspace_layout.addLayout(content_layout, 1)
         layout.addWidget(workspace, 1)
         self.settings_page.theme_changed.connect(self.on_theme_changed)
+        self.settings_page.settings_saved.connect(self.on_settings_saved)
         self.import_page.project_combo.currentIndexChanged.connect(self.update_header)
         self.update_header()
         self.sync_database_files()
@@ -304,9 +305,12 @@ class MainWindow(QMainWindow):
         self.settings_page = SettingsPage()
         self.add_scrollable_page(stack, self.settings_page)
 
-        # AI标注页添加/修改标签后，标注页类别列表实时同步
+        # AI标注页与标注页类别列表双向同步
         self.ai_label_page.classes_changed.connect(
             self._on_ai_classes_changed
+        )
+        self.annotate_page.classes_changed.connect(
+            self._on_annotate_classes_changed
         )
 
         # 关于页面
@@ -406,12 +410,28 @@ class MainWindow(QMainWindow):
         self.scale_manager.set_scale(self.scale_manager.percent)
         self.settings.setValue("theme", "深色主题")
 
+    def on_settings_saved(self):
+        """偏好设置保存或重置后同步快捷键、自动保存定时器与模型路径配置"""
+        if hasattr(self, 'annotate_page') and hasattr(self.annotate_page, 'apply_user_settings'):
+            self.annotate_page.apply_user_settings()
+
     def _on_ai_classes_changed(self):
         """AI标注页标签同步到DB后，刷新标注页的类别列表"""
         try:
             if (self.annotate_page.current_project_id ==
                     self.ai_label_page.current_project_id):
                 self.annotate_page.refresh_classes()
+        except RuntimeError:
+            pass  # 页面销毁中，忽略
+
+    def _on_annotate_classes_changed(self, change_info=None):
+        """标注页新增/编辑/删除类别后，同步标签名到AI标注页（描述留空交由AI生成）"""
+        try:
+            project_id = self.annotate_page.current_project_id
+            if project_id:
+                self.ai_label_page.on_external_project_classes_changed(
+                    project_id, change_info
+                )
         except RuntimeError:
             pass  # 页面销毁中，忽略
 

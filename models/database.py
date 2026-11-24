@@ -121,6 +121,11 @@ class Database:
                 cursor.execute(
                     "ALTER TABLE images ADD COLUMN ai_original TEXT"
                 )
+            # 迁移: file_hash列(用于图像MD5去重)
+            if 'file_hash' not in _img_cols:
+                cursor.execute(
+                    "ALTER TABLE images ADD COLUMN file_hash TEXT"
+                )
 
             
             # 创建标注表
@@ -180,6 +185,7 @@ class Database:
             # 创建索引
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_project ON images(project_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_project_status ON images(project_id, status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_project_hash ON images(project_id, file_hash)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_annotations_image ON annotations(image_id)")
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_annotations_project_class_image "
@@ -278,18 +284,51 @@ class Database:
     def add_image(self, project_id: int, filename: str, storage_path: str,
                   width: int = None, height: int = None, size: int = None,
                   image_format: str = None, original_path: str = None,
-                  dataset_id: int = None) -> int:
+                  dataset_id: int = None, file_hash: str = None) -> int:
         """添加图像记录"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO images 
                 (project_id, dataset_id, filename, original_path, storage_path, 
-                 width, height, size, format)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 width, height, size, format, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (project_id, dataset_id, filename, original_path, storage_path,
-                  width, height, size, image_format))
+                  width, height, size, image_format, file_hash))
             return cursor.lastrowid
+
+    def update_image_hash(self, image_id: int, file_hash: str) -> bool:
+        """更新图像的哈希值（用于存量图片惰性回填）"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE images SET file_hash = ? WHERE id = ?",
+                (file_hash, image_id)
+            )
+            return cursor.rowcount > 0
+
+    def get_image_by_hash(self, project_id: int, file_hash: str) -> Optional[Dict]:
+        """根据文件哈希查找项目内已存在的图像记录"""
+        if not file_hash:
+            return None
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM images WHERE project_id = ? AND file_hash = ? LIMIT 1",
+                (project_id, file_hash)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def project_has_annotations(self, project_id: int) -> bool:
+        """快速判断项目下是否已存在任何标注记录"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM annotations WHERE project_id = ? LIMIT 1",
+                (project_id,)
+            )
+            return cursor.fetchone() is not None
     
     def get_project_images(self, project_id: int, status: str = None) -> List[Dict]:
         """获取项目下的所有图像"""
@@ -653,6 +692,31 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
             return cursor.rowcount > 0
+
+    def rename_project_class_annotations(self, project_id: int, class_id: int, new_name: str) -> int:
+        """重命名项目内指定类别ID对应的所有标注类别名称"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE annotations SET class_name = ?, updated_at = ? WHERE project_id = ? AND class_id = ?",
+                (new_name, datetime.now().isoformat(), project_id, class_id)
+            )
+            return cursor.rowcount
+
+    def delete_project_class_and_reindex(self, project_id: int, deleted_class_id: int) -> int:
+        """删除项目下指定类别的所有标注，并将后续 class_id 依次前移 1 位"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM annotations WHERE project_id = ? AND class_id = ?",
+                (project_id, deleted_class_id)
+            )
+            removed = cursor.rowcount
+            cursor.execute(
+                "UPDATE annotations SET class_id = class_id - 1 WHERE project_id = ? AND class_id > ?",
+                (project_id, deleted_class_id)
+            )
+            return removed
     
     # ==================== 训练任务操作 ====================
     
