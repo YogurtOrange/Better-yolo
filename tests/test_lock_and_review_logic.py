@@ -443,9 +443,13 @@ class LockAndReviewLogicTests(unittest.TestCase):
         self.assertEqual(ai_page.log_edit.toPlainText().strip(), "")
         ai_page.deleteLater()
 
-    def test_version_bumped_to_1_1_2(self):
-        self.assertEqual(app_info.APP_VERSION, "1.1.2")
-        self.assertEqual(app_info.LAST_UPDATED, "2026-11-25")
+    def test_version_synced_with_changelog(self):
+        import re
+        changelog = (Path(__file__).parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        m = re.search(r"^## \[([^\]]+)\] - (\d{4}-\d{2}-\d{2})", changelog, re.M)
+        self.assertIsNotNone(m)
+        self.assertEqual(app_info.APP_VERSION, m.group(1))
+        self.assertEqual(app_info.LAST_UPDATED, m.group(2))
 
 
 if __name__ == '__main__':

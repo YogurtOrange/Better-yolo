@@ -2479,6 +2479,8 @@ class AnnotatePage(QWidget):
 
     # 项目类别在标注页发生增/删/改时发出，通知AI标注页同步标签名
     classes_changed = pyqtSignal(dict)
+    # 项目图片与标签名批量重命名后发出，通知导入页与AI标注页刷新
+    images_renamed = pyqtSignal(int)
     
     def __init__(self):
         super().__init__()
@@ -3286,7 +3288,14 @@ class AnnotatePage(QWidget):
         format_layout.addRow("导出格式:", self.export_format)
         export_layout.addLayout(format_layout)
         
-        # 导出按钮
+        # 一键重命名与导出按钮
+        self.btn_rename_dataset = QPushButton("✏️ 一键重命名图片与标签")
+        self.btn_rename_dataset.setToolTip(
+            "按序号一键重命名图片与对应标签文件（默认 img_001 起，可自定义起始编号，支持当前项目与外部目录）"
+        )
+        self.btn_rename_dataset.clicked.connect(self.open_rename_dialog)
+        export_layout.addWidget(self.btn_rename_dataset)
+
         self.btn_export_annotations = QPushButton("📤 导出标注文件")
         self.btn_export_annotations.clicked.connect(self.export_annotations)
         export_layout.addWidget(self.btn_export_annotations)
@@ -6223,6 +6232,31 @@ class AnnotatePage(QWidget):
                         annotation_id += 1
 
         return coco_data
+
+    def open_rename_dialog(self):
+        """打开数据集图片与标签一键重命名弹窗"""
+        from gui.pages.dataset_rename_dialog import DatasetRenameDialog
+
+        dlg = DatasetRenameDialog(self, project_id=self.current_project_id)
+        dlg.project_renamed.connect(self._on_project_renamed)
+        dlg.exec()
+
+    def _on_project_renamed(self, project_id: int):
+        self.refresh_after_project_rename(project_id)
+        self.images_renamed.emit(project_id)
+
+    def refresh_after_project_rename(self, project_id: int = None):
+        """项目内图片重命名后刷新列表并保持当前选中图片打开状态"""
+        if project_id and project_id != self.current_project_id:
+            return
+        if not self.current_project_id:
+            return
+        keep_image_id = self.current_image_id
+        self.load_image_list()
+        if keep_image_id and any(img['id'] == keep_image_id for img in self.images):
+            self.load_image(keep_image_id)
+        elif self.images:
+            self.load_image(self.images[0]['id'])
 
     def export_annotations(self):
         """导出标注文件"""

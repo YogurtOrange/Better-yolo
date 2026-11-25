@@ -312,6 +312,13 @@ class MainWindow(QMainWindow):
         self.annotate_page.classes_changed.connect(
             self._on_annotate_classes_changed
         )
+        # 一键重命名项目图片后跨页面刷新同步
+        self.import_page.images_renamed.connect(
+            self._on_project_images_renamed
+        )
+        self.annotate_page.images_renamed.connect(
+            self._on_project_images_renamed
+        )
 
         # 关于页面
         self.about_page = AboutPage()
@@ -434,6 +441,20 @@ class MainWindow(QMainWindow):
                 )
         except RuntimeError:
             pass  # 页面销毁中，忽略
+
+    def _on_project_images_renamed(self, project_id: int):
+        """任一入口重命名项目图片后，同步刷新导入页、标注页与AI标注页"""
+        if not project_id:
+            return
+        try:
+            if self.import_page.current_project_id == project_id:
+                self.import_page.refresh_after_project_rename(project_id)
+            if self.annotate_page.current_project_id == project_id:
+                self.annotate_page.refresh_after_project_rename(project_id)
+            if self.ai_label_page.current_project_id == project_id:
+                self.ai_label_page.refresh_project_stats()
+        except RuntimeError:
+            pass
 
     def closeEvent(self, event):
         """关闭事件"""

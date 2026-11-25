@@ -608,6 +608,18 @@ class Database:
             cursor.execute("DELETE FROM images WHERE id = ?", (image_id,))
             
             return cursor.rowcount > 0
+
+    def batch_update_image_filenames(self, updates: List[tuple]) -> int:
+        """批量更新图片文件名与实际存储路径: [(new_filename, new_storage_path, image_id), ...]"""
+        if not updates:
+            return 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                "UPDATE images SET filename = ?, storage_path = ? WHERE id = ?",
+                updates,
+            )
+            return cursor.rowcount
     
     # ==================== 标注操作 ====================
     

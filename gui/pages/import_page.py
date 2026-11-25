@@ -152,6 +152,8 @@ class ImageLoadWorker(QThread):
 
 class ImportPage(QWidget):
     """导入页面"""
+
+    images_renamed = pyqtSignal(int)
     
     def __init__(self):
         super().__init__()
@@ -367,6 +369,14 @@ class ImportPage(QWidget):
         self.btn_import_annotations.setToolTip("导入已有的标注文件（YOLO/COCO/VOC格式）")
         self.btn_import_annotations.clicked.connect(self.import_annotations)
         layout.addWidget(self.btn_import_annotations)
+
+        # 一键重命名按钮
+        self.btn_rename_dataset = QPushButton("✏️ 一键重命名")
+        self.btn_rename_dataset.setToolTip(
+            "一键按序号批量重命名图片与对应标签（默认 img_001 起，支持当前项目与外部数据集文件夹）"
+        )
+        self.btn_rename_dataset.clicked.connect(self.open_rename_dialog)
+        layout.addWidget(self.btn_rename_dataset)
         
         layout.addStretch()
         
@@ -480,6 +490,26 @@ class ImportPage(QWidget):
         if not self.current_project_id:
             return
         self.load_project_images()
+
+    def refresh_after_project_rename(self, project_id: int = None):
+        """项目图片重命名后清空旧路径缩略图缓存并重新加载"""
+        if project_id and project_id != self.current_project_id:
+            return
+        self.thumbnail_cache.clear()
+        if self.current_project_id:
+            self.load_project_images()
+
+    def open_rename_dialog(self):
+        """打开数据集图片与标签一键重命名弹窗"""
+        from gui.pages.dataset_rename_dialog import DatasetRenameDialog
+
+        dlg = DatasetRenameDialog(self, project_id=self.current_project_id)
+        dlg.project_renamed.connect(self._on_project_renamed)
+        dlg.exec()
+
+    def _on_project_renamed(self, project_id: int):
+        self.refresh_after_project_rename(project_id)
+        self.images_renamed.emit(project_id)
     
     def update_task_type_display(self):
         """更新任务类别显示"""
