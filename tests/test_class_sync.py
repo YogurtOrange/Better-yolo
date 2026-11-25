@@ -240,12 +240,17 @@ class ClassSyncAndEmptyPresetTests(unittest.TestCase):
 
     def test_version_info_synced(self):
         import re
-        changelog = (Path(__file__).parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        root_dir = Path(__file__).parent.parent
+        changelog = (root_dir / "CHANGELOG.md").read_text(encoding="utf-8")
         m = re.search(r"^## \[([^\]]+)\] - (\d{4}-\d{2}-\d{2})", changelog, re.M)
         self.assertIsNotNone(m)
         self.assertEqual(app_info.APP_VERSION, m.group(1))
         self.assertEqual(app_info.LAST_UPDATED, m.group(2))
         self.assertRegex(app_info.APP_VERSION, r"^\d+\.\d+\.\d+$")
+
+        readme = (root_dir / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"Version-v{app_info.APP_VERSION}-", readme)
+        self.assertIn(f"`v{app_info.APP_VERSION}`", readme)
 
 
 if __name__ == '__main__':
