@@ -23,6 +23,13 @@ pretrained/
 
 # AI标注API Key 与本地模型配置, 随用户使用生成, 勿提交
 config/*.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 
 # ==================== Python ====================
 __pycache__/
