@@ -7,10 +7,11 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QGridLayout, QFrame, QFileDialog, QProgressBar,
-    QMenu, QMessageBox, QComboBox, QLineEdit, QListWidget, QListWidgetItem
+    QMenu, QMessageBox, QComboBox, QLineEdit, QListWidget, QListWidgetItem,
+    QDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QIcon
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QIcon, QKeySequence, QShortcut
 import cv2
 import numpy as np
 from pathlib import Path
@@ -22,6 +23,7 @@ from models.database import db
 from core.import_manager import ImportManager
 from core.annotation_importer import AnnotationImporter
 from gui.widgets.loading_dialog import LoadingOverlay
+from gui.widgets.image_preview import ImagePreview
 
 
 # 视频导入线程
@@ -273,6 +275,7 @@ class ImportPage(QWidget):
         self.image_list.setUniformItemSizes(True)  # 统一项目大小，优化布局
         self.image_list.setGridSize(QSize(180, 200))  # 设置固定网格大小
         self.image_list.itemClicked.connect(self.on_image_clicked)
+        self.image_list.itemDoubleClicked.connect(self.open_image_preview)
         self.image_list.setStyleSheet(f"""
             QListWidget {{ background: {COLORS['background']}; border: none; }}
             QListWidget::item {{
@@ -899,14 +902,26 @@ class ImportPage(QWidget):
         pixmap = None
         if storage_path and os.path.exists(storage_path):
             try:
-                img = cv2.imread(storage_path)
-                if img is not None:
-                    img = cv2.resize(img, (160, 160))
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    h, w, ch = img.shape
-                    bytes_per_line = ch * w
-                    qt_image = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                    pixmap = QPixmap.fromImage(qt_image)
+                loaded = QPixmap(storage_path)
+                if not loaded.isNull():
+                    pixmap = loaded.scaled(
+                        160,
+                        160,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                else:
+                    raw = np.fromfile(storage_path, dtype=np.uint8)
+                    img = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size > 0 else None
+                    if img is not None:
+                        img = cv2.resize(img, (160, 160))
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        h, w, ch = img.shape
+                        bytes_per_line = ch * w
+                        qt_image = QImage(
+                            img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888
+                        ).copy()
+                        pixmap = QPixmap.fromImage(qt_image)
             except Exception:
                 pass
 
@@ -963,10 +978,40 @@ class ImportPage(QWidget):
                 item.setHidden(status == 'pending')
     
     def on_image_clicked(self, item: QListWidgetItem):
-        """图像点击事件"""
+        """图像单击事件（保持多选体验，双击打开大图预览）"""
         image_id = item.data(Qt.ItemDataRole.UserRole)
-        # TODO: 实现图像预览或编辑
-        pass
+        image_data = next((img for img in self.images if img.get('id') == image_id), None)
+        if image_data:
+            filename = image_data.get('filename', '')
+            width = image_data.get('width')
+            height = image_data.get('height')
+            dim_text = f" ({width}×{height})" if width and height else ""
+            item.setToolTip(f"{filename}{dim_text}\n双击查看大图预览")
+
+    def open_image_preview(self, item: QListWidgetItem):
+        """双击缩略图打开原图预览弹窗，支持键盘左右翻页"""
+        if item is None:
+            return
+        image_id = item.data(Qt.ItemDataRole.UserRole)
+        visible_images = []
+        for i in range(self.image_list.count()):
+            list_item = self.image_list.item(i)
+            if list_item.isHidden():
+                continue
+            item_id = list_item.data(Qt.ItemDataRole.UserRole)
+            data = next((img for img in self.images if img.get('id') == item_id), None)
+            if data is not None:
+                visible_images.append(data)
+
+        if not visible_images:
+            return
+
+        start_idx = next(
+            (idx for idx, img in enumerate(visible_images) if img.get('id') == image_id),
+            0,
+        )
+        dialog = ImportImagePreviewDialog(visible_images, start_idx, parent=self)
+        dialog.exec()
     
     def update_status_bar(self):
         """更新状态栏"""
@@ -1647,3 +1692,145 @@ class ImportPage(QWidget):
             QMessageBox.information(self, "删除完成", f"已成功删除 {deleted} 张图片")
         else:
             QMessageBox.warning(self, "删除完成", f"成功删除 {deleted} 张，失败 {failed} 张")
+
+
+class ImportImagePreviewDialog(QDialog):
+    """导入页大图预览弹窗，支持元信息展示与左右键翻页。"""
+
+    def __init__(self, images: List[Dict], start_index: int = 0, parent=None):
+        super().__init__(parent)
+        self.images = list(images or [])
+        self.current_index = max(0, min(start_index, len(self.images) - 1)) if self.images else -1
+
+        self.setWindowTitle("图像预览")
+        self.resize(900, 660)
+        self.setMinimumSize(640, 480)
+        self._init_ui()
+        self._show_current()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        self.meta_label = QLabel("")
+        self.meta_label.setWordWrap(True)
+        self.meta_label.setStyleSheet(
+            f"color: {COLORS['text_primary']}; font-size: 13px; font-weight: bold;"
+        )
+        layout.addWidget(self.meta_label)
+
+        self.path_label = QLabel("")
+        self.path_label.setWordWrap(True)
+        self.path_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 12px;"
+        )
+        layout.addWidget(self.path_label)
+
+        preview_frame = QFrame()
+        preview_frame.setStyleSheet(
+            f"QFrame {{ background-color: {COLORS['sidebar']}; "
+            f"border: 1px solid {COLORS['border']}; border-radius: 8px; }}"
+        )
+        frame_layout = QVBoxLayout(preview_frame)
+        frame_layout.setContentsMargins(10, 10, 10, 10)
+        self.preview = ImagePreview("无法加载图像")
+        frame_layout.addWidget(self.preview, 1)
+        layout.addWidget(preview_frame, 1)
+
+        nav_layout = QHBoxLayout()
+        nav_layout.setSpacing(10)
+        self.btn_prev = QPushButton("← 上一张")
+        self.btn_prev.clicked.connect(self.show_prev)
+        nav_layout.addWidget(self.btn_prev)
+
+        self.index_label = QLabel("")
+        self.index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.index_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        nav_layout.addWidget(self.index_label, 1)
+
+        self.btn_next = QPushButton("下一张 →")
+        self.btn_next.clicked.connect(self.show_next)
+        nav_layout.addWidget(self.btn_next)
+
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.clicked.connect(self.accept)
+        nav_layout.addWidget(self.btn_close)
+        layout.addLayout(nav_layout)
+
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, activated=self.show_prev)
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=self.show_next)
+
+    @staticmethod
+    def _format_size(size_bytes: Optional[int]) -> str:
+        if not size_bytes or size_bytes <= 0:
+            return "未知大小"
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        if size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+    @staticmethod
+    def _load_pixmap(filepath: str) -> QPixmap:
+        if not filepath or not os.path.exists(filepath):
+            return QPixmap()
+        pix = QPixmap(filepath)
+        if not pix.isNull():
+            return pix
+        try:
+            raw = np.fromfile(filepath, dtype=np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size > 0 else None
+            if img is None:
+                return QPixmap()
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w, ch = img.shape
+            qimg = QImage(img.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+            return QPixmap.fromImage(qimg)
+        except Exception:
+            return QPixmap()
+
+    def _show_current(self):
+        total = len(self.images)
+        if total == 0 or self.current_index < 0:
+            self.meta_label.setText("暂无可预览图像")
+            self.path_label.setText("")
+            self.index_label.setText("0 / 0")
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+            self.preview.setText("暂无图像")
+            return
+
+        data = self.images[self.current_index]
+        filename = data.get("filename", "")
+        storage_path = data.get("storage_path", "")
+        width = data.get("width")
+        height = data.get("height")
+        size = data.get("size")
+        status_text = "已标注" if data.get("status") == "annotated" else "未标注"
+        dim_text = f"{width}×{height}" if width and height else "未知尺寸"
+
+        self.setWindowTitle(f"图像预览 - {filename}")
+        self.meta_label.setText(
+            f"{filename}  ·  {dim_text}  ·  {self._format_size(size)}  ·  {status_text}"
+        )
+        self.path_label.setText(storage_path)
+        self.index_label.setText(f"{self.current_index + 1} / {total}")
+        self.btn_prev.setEnabled(self.current_index > 0)
+        self.btn_next.setEnabled(self.current_index < total - 1)
+
+        pixmap = self._load_pixmap(storage_path)
+        if pixmap.isNull():
+            self.preview.setText("无法加载图像文件")
+        else:
+            self.preview.setPixmap(pixmap)
+
+    def show_prev(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._show_current()
+
+    def show_next(self):
+        if self.current_index < len(self.images) - 1:
+            self.current_index += 1
+            self._show_current()

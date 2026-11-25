@@ -23,6 +23,10 @@
 
 ## 1. 安装与启动
 
+> 🚀 **推荐新手直接看 [一键安装与环境配置教程](SETUP_GUIDE.md)**：只需运行 `./setup.sh --mirror tuna`（Linux/macOS）或 `setup.bat --mirror tuna`（Windows），脚本会自动创建虚拟环境并匹配 GPU/CPU 版本的 PyTorch 与依赖。
+
+手动安装方式：
+
 ```bash
 # 1) 建议先创建虚拟环境 (conda / venv 均可)
 conda create -n better-yolo python=3.10 -y

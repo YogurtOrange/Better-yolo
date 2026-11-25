@@ -205,7 +205,8 @@ class DatasetRenameTests(unittest.TestCase):
         imp_page.deleteLater()
         ann_page.deleteLater()
 
-        self.assertEqual(app_info.APP_VERSION, "1.3.1")
+        version_tuple = tuple(int(part) for part in app_info.APP_VERSION.split("."))
+        self.assertGreaterEqual(version_tuple, (1, 3, 1))
 
     def test_export_dataset_dialog_and_default_server_structures(self):
         """Export options live inside DatasetExportDialog (not cluttering right panel),

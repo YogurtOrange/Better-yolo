@@ -2,6 +2,30 @@
 
 本文件记录 Better-YOLO 每次功能迭代与修复的版本演进。
 
+## [1.4.1] - 2026-11-25
+
+### 文档与体验
+- **新增新手一键安装与环境配置教程（`docs/SETUP_GUIDE.md`）**：提供 Windows / Linux / macOS 分平台一键配置步骤、进阶参数速查表、AI 标注 API Key 配置引导与常见排错方案，并在 `README.md` 与 `docs/TUTORIAL.md` 醒目位置建立入口链接。
+
+## [1.4.0] - 2026-11-25
+
+### 新增与重构
+- **新增一键环境配置与体检脚本（分发体验优化）**：
+  - 新增纯标准库脚本 `scripts/setup_env.py` 及跨平台一键入口 `setup.sh`（Linux/macOS）与 `setup.bat`（Windows）；
+  - 支持自动检测 NVIDIA GPU 与驱动 CUDA 版本并匹配对应 PyTorch CUDA / CPU wheel 及 `onnxruntime-gpu` / `onnxruntime` 变体，内置清华/阿里云/中科大 PyPI 镜像快捷参数（`--mirror tuna`）、预览模式（`--dry-run`）与环境健康体检报告（`--check` / `--json`）。
+- **巨型文件模块化拆分（`annotate_page.py` 减重 37%）**：
+  - 将 `gui/pages/annotate_page.py`（原 6,630 行）中的独立职责拆分为 `gui/canvas/annotation_canvas.py`（标注画布）、`core/sam_manager.py`（SAM 模型缓存、记忆预测器与推理线程）、`gui/widgets/sam_memory_dialog.py`（SAM 记忆对象弹窗）及 `gui/pages/annotate_workers.py`（缩略图与随机删除工作线程），并在原模块保留向后兼容重导出；同步修复缩略图后台线程中文路径加载问题。
+
+## [1.3.2] - 2026-11-25
+
+### 优化与修复
+- **SQLite 并发与完整性加固**：`models/database.py` 统一开启 `WAL` 日志模式、`synchronous=NORMAL`、30 秒锁等待超时（`timeout` / `busy_timeout`）与 `PRAGMA foreign_keys=ON`，彻底避免高并发 AI 标注写库锁死并真正生效级联删除约束。
+- **训练结果页多实验切换与后台异步导出**：
+  - `04 训练结果` 新增「训练实验」历史下拉选择器，按最新修改时间倒序排列（修复字典序错位与只能查看最后一个实验的问题），切换实验同步刷新结果图与 `results.csv` 指标（自动清洗列名空白）；
+  - 将 ONNX / TensorRT / TorchScript / `.pt` / 结果文件夹导出移入 `ModelExportThread` 后台线程并展示进度条，消除导出阻塞界面的卡顿；
+  - 图像预览改为中文路径安全加载（`QPixmap` + `cv2.imdecode(np.fromfile(...))` 兜底），修复含中文路径时预览失败的问题。
+- **数据导入页大图预览**：实现 `01 数据导入` 缩略图双击大图预览弹窗（`ImportImagePreviewDialog`），支持展示分辨率/文件大小/标注状态与键盘 `←`/`→` 翻页，并同步兼容中文路径缩略图加载。
+
 ## [1.3.1] - 2026-11-25
 
 ### 优化与修复

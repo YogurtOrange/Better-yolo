@@ -14,14 +14,18 @@ from contextlib import contextmanager
 
 class Database:
     """数据库管理类"""
+
+    DEFAULT_TIMEOUT = 30.0
     
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, timeout: float = DEFAULT_TIMEOUT):
         """
         初始化数据库
         
         Args:
             db_path: 数据库文件路径，默认为项目目录下的data/BetterYOLO.db
+            timeout: SQLite 锁等待超时时间（秒）
         """
+        self.timeout = float(timeout)
         if db_path is None:
             # 默认存储在软件所在目录
             current_dir = Path(__file__).parent.parent
@@ -37,8 +41,10 @@ class Database:
     @contextmanager
     def get_connection(self):
         """获取数据库连接的上下文管理器"""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=self.timeout)
         conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
@@ -52,6 +58,9 @@ class Database:
         """初始化数据库表结构"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            # 启用 WAL 日志模式与 NORMAL 同步，提升多线程并发读写稳定性
+            cursor.execute("PRAGMA journal_mode = WAL")
+            cursor.execute("PRAGMA synchronous = NORMAL")
             
             # 创建项目表
             cursor.execute("""

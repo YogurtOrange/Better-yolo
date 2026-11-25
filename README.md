@@ -1,6 +1,6 @@
 # Better-YOLO 全流程YOLO训练工具
 
-[![Version](https://img.shields.io/badge/Version-v1.3.1-2563EB)](#版本更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.4.1-2563EB)](#版本更新日志)
 [![Changelog](https://img.shields.io/badge/Changelog-更新记录-F59E0B)](CHANGELOG.md)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![GUI](https://img.shields.io/badge/Desktop-PyQt6-41CD52?logo=qt&logoColor=white)
@@ -12,7 +12,7 @@
 
 集成了以 **Qwen-VL 多模态大模型为核心的 AI 自动标注闭环**，支持通过"AI 生成提示词 → 试标 → 人工修正 → AI 对比反馈再优化"的方式持续提升 AI 标注准确率。
 
-> 📖 **新手请看 [docs/TUTORIAL.md](docs/TUTORIAL.md) 图文教学**：从创建项目到训练出模型的完整流程演示（含全部界面截图）。
+> 🚀 **新手安装请看 [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md) 一键配置教程**；使用流程请看 **[docs/TUTORIAL.md](docs/TUTORIAL.md) 图文教学**（含全部界面截图）。
 
 ![AI 智能标注](docs/images/03_ai_label.png)
 
@@ -46,6 +46,9 @@
 
 | 版本 | 日期 | 类型 | 核心更新内容 |
 | :--- | :--- | :--- | :--- |
+| **`v1.4.1`** | `2026-11-25` | 📖 文档 | 新增 **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** 新手一键安装与环境配置教程（涵盖 Win/Linux/macOS 步骤、镜像加速与常见排错），并打通 `README.md` 与 `docs/TUTORIAL.md` 导航入口 |
+| **`v1.4.0`** | `2026-11-25` | 🚀 特性 | 新增**一键环境配置与体检脚本**（`setup.sh` / `setup.bat` / `scripts/setup_env.py`，自动识别 GPU/CUDA 并支持镜像加速）；完成巨型文件 `annotate_page.py` 模块化拆解（拆出画布 `gui/canvas/`、SAM 管理器 `core/sam_manager.py` 及后台线程模块） |
+| **`v1.3.2`** | `2026-11-25` | ⚡ 优化 | 加固 SQLite 并发（开启 `WAL` + 30s 超时 + 外键级联约束）；`04 训练结果` 新增**历史训练实验下拉切换**、**后台异步模型导出**与中文路径预览修复；`01 数据导入` 补齐**双击大图预览弹窗**（支持 `←`/`→` 翻页） |
 | **`v1.3.1`** | `2026-11-25` | ⚡ 优化 | 导出格式、目录结构与训练:验证比例改为**点击导出按钮后独立弹窗配置**（含目录树预览），精简标注页右侧栏并释放「类别列表」完整显示空间 |
 | **`v1.3.0`** | `2026-11-25` | 🚀 特性 | 导出完整数据集新增**默认结构**（`images/{train,val}` + `labels/{train,val}`）与**服务器结构**（`train/{images,labels}` + `val/{images,labels}`）选择及训练:验证比例划分（默认 `8:2`） |
 | **`v1.2.0`** | `2026-11-25` | 🚀 特性 | 新增**一键重命名数据集图片与标签**功能（默认 `img_001` 起，可自由指定起始编号与前缀，同时支持当前项目与外部 YOLO/VOC/COCO 数据集目录双阶段无冲突重命名） |
@@ -76,6 +79,26 @@
 </details>
 
 ## 安装
+
+### 方式一：一键配置脚本（推荐）
+
+脚本会自动创建/复用 Conda 或 `.venv` 虚拟环境，检测 NVIDIA GPU 与驱动 CUDA 版本并安装匹配的 PyTorch 与全部依赖，最后自动输出环境体检报告：
+
+```bash
+# Linux / macOS（国内用户可追加 --mirror tuna 使用清华镜像加速）
+./setup.sh
+./setup.sh --mirror tuna
+
+# Windows（命令行或双击运行）
+setup.bat --mirror tuna
+
+# 仅做环境体检 / 强制 CPU 版安装 / 预览将执行的命令
+python scripts/setup_env.py --check
+./setup.sh --cpu
+python scripts/setup_env.py --install --dry-run
+```
+
+### 方式二：手动安装
 
 ```bash
 # 1. 安装依赖
