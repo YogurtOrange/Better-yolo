@@ -205,7 +205,92 @@ class DatasetRenameTests(unittest.TestCase):
         imp_page.deleteLater()
         ann_page.deleteLater()
 
-        self.assertEqual(app_info.APP_VERSION, "1.2.0")
+        self.assertEqual(app_info.APP_VERSION, "1.3.1")
+
+    def test_export_dataset_dialog_and_default_server_structures(self):
+        """Export options live inside DatasetExportDialog (not cluttering right panel),
+        and export_dataset supports both default structure and server structure with 8:2 and custom ratios."""
+        from PyQt6.QtCore import QSettings
+        from gui.pages.dataset_export_dialog import DatasetExportDialog
+
+        QSettings("Better-YOLO", "ExportDataset").clear()
+
+        for idx in range(1, 11):
+            fname = f"img_{idx:03d}.png"
+            sp = self.proj_storage / "images" / fname
+            self._create_img(sp, color=(idx * 10, 50, 100))
+            iid = self.temp_db.add_image(self.project_id, fname, str(sp), width=100, height=80)
+            self.temp_db.add_annotation(
+                iid, self.project_id, 0, "target", "bbox",
+                {"x": 10, "y": 10, "width": 30, "height": 30},
+            )
+
+        page = AnnotatePage()
+        page.current_project_id = self.project_id
+        page.classes = [{"id": 0, "name": "target", "color": "#EF4444"}]
+
+        # Right panel no longer embeds yolo_split_widget; options live in DatasetExportDialog!
+        self.assertFalse(hasattr(page, 'yolo_split_widget'))
+        self.assertTrue(page.export_format.isHidden())
+
+        dlg = DatasetExportDialog(page, mode="dataset", image_count=10)
+        cfg = dlg.get_config()
+        self.assertEqual(cfg["export_format"], "YOLO格式")
+        self.assertEqual(cfg["structure_mode"], "default")
+        self.assertEqual(cfg["train_ratio"], 8)
+        self.assertEqual(cfg["val_ratio"], 2)
+        self.assertIn("预计训练集 8 张，验证集 2 张", dlg.lbl_split_summary.text())
+        dlg.rb_server_struct.setChecked(True)
+        self.assertEqual(dlg.get_structure_mode(), "server")
+        self.assertIn("├── train", dlg.lbl_tree_preview.text())
+        dlg.deleteLater()
+
+        out_dir = self.root / "split_exports"
+        out_dir.mkdir()
+        ds_dir = out_dir / "rename_proj"
+
+        # 1) Default structure (8:2 on 10 images -> 8 train, 2 val)
+        with patch.object(QFileDialog, 'getExistingDirectory', return_value=str(out_dir)), \
+                patch.object(QMessageBox, 'information'):
+            page.export_dataset(
+                export_format="YOLO格式",
+                structure_mode="default",
+                train_ratio=8,
+                val_ratio=2,
+                shuffle=False,
+            )
+
+        self.assertEqual(len(list((ds_dir / "images" / "train").glob("*.png"))), 8)
+        self.assertEqual(len(list((ds_dir / "images" / "val").glob("*.png"))), 2)
+        self.assertEqual(len(list((ds_dir / "labels" / "train").glob("*.txt"))), 8)
+        self.assertEqual(len(list((ds_dir / "labels" / "val").glob("*.txt"))), 2)
+        yaml_default = (ds_dir / "data.yaml").read_text(encoding="utf-8")
+        self.assertIn("train: images/train", yaml_default)
+        self.assertIn("val: images/val", yaml_default)
+
+        # 2) Server structure with custom 7:3 ratio into the same target dir -> cleanly switches tree!
+        with patch.object(QFileDialog, 'getExistingDirectory', return_value=str(out_dir)), \
+                patch.object(QMessageBox, 'information'):
+            page.export_dataset(
+                export_format="YOLO格式",
+                structure_mode="server",
+                train_ratio=7,
+                val_ratio=3,
+                shuffle=False,
+            )
+
+        self.assertFalse((ds_dir / "images").exists())
+        self.assertFalse((ds_dir / "labels").exists())
+        self.assertEqual(len(list((ds_dir / "train" / "images").glob("*.png"))), 7)
+        self.assertEqual(len(list((ds_dir / "train" / "labels").glob("*.txt"))), 7)
+        self.assertEqual(len(list((ds_dir / "val" / "images").glob("*.png"))), 3)
+        self.assertEqual(len(list((ds_dir / "val" / "labels").glob("*.txt"))), 3)
+        yaml_server = (ds_dir / "data.yaml").read_text(encoding="utf-8")
+        self.assertIn("train: train/images", yaml_server)
+        self.assertIn("val: val/images", yaml_server)
+        self.assertNotIn("path:", yaml_server)
+
+        page.deleteLater()
 
 
 if __name__ == '__main__':

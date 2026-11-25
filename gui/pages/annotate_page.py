@@ -3142,7 +3142,8 @@ class AnnotatePage(QWidget):
         self.class_list.itemClicked.connect(self.on_class_selected)
         self.class_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.class_list.customContextMenuRequested.connect(self.show_class_context_menu)
-        class_layout.addWidget(self.class_list)
+        self.class_list.setMinimumHeight(130)
+        class_layout.addWidget(self.class_list, 1)
         
         compact_action_button_height = 24
         compact_action_button_style = f"""
@@ -3201,7 +3202,7 @@ class AnnotatePage(QWidget):
         ann_action_row.addWidget(self.btn_save_ann, 1)
         class_layout.addLayout(ann_action_row)
         
-        layout.addWidget(class_group)
+        layout.addWidget(class_group, 1)
         
         # 标注属性 / 样本调节
         attr_group = QGroupBox("标注属性")
@@ -3276,20 +3277,22 @@ class AnnotatePage(QWidget):
         
         layout.addWidget(attr_group)
         
-        # 导出功能
+        # 导出功能（保持极简紧凑，不占用上方类别列表高度；格式与目录结构在点击导出后弹窗选择）
         export_group = QGroupBox("数据导出")
         export_group.setStyleSheet(class_group.styleSheet())
         export_layout = QVBoxLayout(export_group)
+        export_layout.setSpacing(6)
+        export_layout.setContentsMargins(8, 8, 8, 8)
         
-        # 导出格式选择
-        format_layout = QFormLayout()
+        # 保留隐藏的默认格式控件以兼容编程调用，不在右侧窄栏中占空间
         self.export_format = QComboBox()
         self.export_format.addItems(["YOLO格式", "COCO格式"])
-        format_layout.addRow("导出格式:", self.export_format)
-        export_layout.addLayout(format_layout)
+        self.export_format.hide()
         
         # 一键重命名与导出按钮
         self.btn_rename_dataset = QPushButton("✏️ 一键重命名图片与标签")
+        self.btn_rename_dataset.setFixedHeight(compact_action_button_height + 2)
+        self.btn_rename_dataset.setStyleSheet(compact_action_button_style)
         self.btn_rename_dataset.setToolTip(
             "按序号一键重命名图片与对应标签文件（默认 img_001 起，可自定义起始编号，支持当前项目与外部目录）"
         )
@@ -3297,16 +3300,18 @@ class AnnotatePage(QWidget):
         export_layout.addWidget(self.btn_rename_dataset)
 
         self.btn_export_annotations = QPushButton("📤 导出标注文件")
-        self.btn_export_annotations.clicked.connect(self.export_annotations)
+        self.btn_export_annotations.setFixedHeight(compact_action_button_height + 2)
+        self.btn_export_annotations.setStyleSheet(compact_action_button_style)
+        self.btn_export_annotations.clicked.connect(self.on_click_export_annotations)
         export_layout.addWidget(self.btn_export_annotations)
         
         self.btn_export_dataset = QPushButton("📦 导出完整数据集")
-        self.btn_export_dataset.clicked.connect(self.export_dataset)
+        self.btn_export_dataset.setFixedHeight(compact_action_button_height + 2)
+        self.btn_export_dataset.setStyleSheet(compact_action_button_style)
+        self.btn_export_dataset.clicked.connect(self.on_click_export_dataset)
         export_layout.addWidget(self.btn_export_dataset)
         
         layout.addWidget(export_group)
-        
-        layout.addStretch()
         
         return panel
     
@@ -6258,7 +6263,71 @@ class AnnotatePage(QWidget):
         elif self.images:
             self.load_image(self.images[0]['id'])
 
-    def export_annotations(self):
+    def on_click_export_annotations(self):
+        """点击「导出标注文件」按钮：先弹窗选择导出格式，再选择导出目录"""
+        from PyQt6.QtWidgets import QDialog, QMessageBox
+        from gui.pages.dataset_export_dialog import DatasetExportDialog
+
+        if not self.current_project_id:
+            QMessageBox.warning(self, "导出失败", "请先选择一个项目")
+            return
+
+        images = db.get_project_images(self.current_project_id)
+        if not images:
+            QMessageBox.warning(self, "导出失败", "项目中没有图片")
+            return
+
+        dlg = DatasetExportDialog(
+            self,
+            mode="annotations",
+            image_count=len(images),
+            default_format=self.export_format.currentText(),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        cfg = dlg.get_config()
+        self.export_format.setCurrentText(cfg["export_format"])
+        self.export_annotations(export_format=cfg["export_format"])
+
+    def on_click_export_dataset(self):
+        """点击「导出完整数据集」按钮：先弹窗选择格式、目录结构(默认/服务器)与划分比例(默认 8:2)，再选择导出目录"""
+        from PyQt6.QtWidgets import QDialog, QMessageBox
+        from gui.pages.dataset_export_dialog import DatasetExportDialog
+
+        if not self.current_project_id:
+            QMessageBox.warning(self, "导出失败", "请先选择一个项目")
+            return
+
+        images = db.get_project_images(self.current_project_id)
+        valid_images = [
+            img for img in images
+            if img.get('storage_path') and os.path.exists(img['storage_path'])
+        ]
+        if not valid_images:
+            QMessageBox.warning(self, "导出失败", "项目中没有可用的图片")
+            return
+
+        dlg = DatasetExportDialog(
+            self,
+            mode="dataset",
+            image_count=len(valid_images),
+            default_format=self.export_format.currentText(),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        cfg = dlg.get_config()
+        self.export_format.setCurrentText(cfg["export_format"])
+        self.export_dataset(
+            export_format=cfg["export_format"],
+            structure_mode=cfg["structure_mode"],
+            train_ratio=cfg["train_ratio"],
+            val_ratio=cfg["val_ratio"],
+            shuffle=cfg["shuffle"],
+        )
+
+    def export_annotations(self, export_format: Optional[str] = None):
         """导出标注文件"""
         import json
         from PyQt6.QtWidgets import QMessageBox, QFileDialog
@@ -6276,7 +6345,7 @@ class AnnotatePage(QWidget):
             return
         
         try:
-            export_format = self.export_format.currentText()
+            export_format = export_format or self.export_format.currentText()
             project = db.get_project(self.current_project_id)
             if not project:
                 QMessageBox.warning(self, "导出失败", "无法获取项目信息")
@@ -6345,8 +6414,42 @@ class AnnotatePage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出过程中出错:\n{str(e)}")
     
-    def export_dataset(self):
-        """导出完整数据集（根据下拉框所选格式导出 YOLO 或 COCO 数据集）"""
+    @staticmethod
+    def _split_dataset_images(
+        images: List[Dict],
+        train_ratio: int = 8,
+        val_ratio: int = 2,
+        shuffle: bool = True,
+        seed: int = 42,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """按给定比例（默认 8:2）将有效图片列表切分为 (train_images, val_images)"""
+        import random
+
+        pool = list(images)
+        if shuffle and len(pool) > 1:
+            random.Random(seed).shuffle(pool)
+
+        n = len(pool)
+        if n == 0:
+            return [], []
+        if val_ratio <= 0 or n == 1:
+            return pool, []
+
+        total_weight = max(1, int(train_ratio) + int(val_ratio))
+        val_count = round(n * int(val_ratio) / total_weight)
+        val_count = max(1, min(n - 1, val_count))
+        train_count = n - val_count
+        return pool[:train_count], pool[train_count:]
+
+    def export_dataset(
+        self,
+        export_format: Optional[str] = None,
+        structure_mode: str = "default",
+        train_ratio: int = 8,
+        val_ratio: int = 2,
+        shuffle: bool = True,
+    ):
+        """导出完整数据集（支持 YOLO 默认结构 / 服务器结构与自定义训练:验证比例划分，以及 COCO 格式）"""
         import json
         import shutil
         from PyQt6.QtWidgets import QMessageBox, QFileDialog
@@ -6364,7 +6467,7 @@ class AnnotatePage(QWidget):
             return
         
         try:
-            export_format = self.export_format.currentText()
+            export_format = export_format or self.export_format.currentText()
             project = db.get_project(self.current_project_id)
             if not project:
                 QMessageBox.warning(self, "导出失败", "无法获取项目信息")
@@ -6374,23 +6477,22 @@ class AnnotatePage(QWidget):
             dataset_dir = os.path.join(export_dir, project_name)
             os.makedirs(dataset_dir, exist_ok=True)
             
-            images_dir = os.path.join(dataset_dir, 'images')
-            os.makedirs(images_dir, exist_ok=True)
-            
             images = db.get_project_images(self.current_project_id)
             if not images:
                 QMessageBox.warning(self, "导出失败", "项目中没有图片")
                 return
-            
-            copied_count = 0
-            for image in images:
-                src_image = image.get('storage_path', '')
-                if src_image and os.path.exists(src_image):
-                    dst_image = os.path.join(images_dir, image['filename'])
-                    shutil.copy2(src_image, dst_image)
-                    copied_count += 1
 
             if export_format == "COCO格式":
+                images_dir = os.path.join(dataset_dir, 'images')
+                os.makedirs(images_dir, exist_ok=True)
+                copied_count = 0
+                for image in images:
+                    src_image = image.get('storage_path', '')
+                    if src_image and os.path.exists(src_image):
+                        dst_image = os.path.join(images_dir, image['filename'])
+                        shutil.copy2(src_image, dst_image)
+                        copied_count += 1
+
                 coco_data = self._build_coco_export_dict(project_name, images)
                 coco_file = os.path.join(dataset_dir, 'annotations.json')
                 with open(coco_file, 'w', encoding='utf-8') as f:
@@ -6405,32 +6507,89 @@ class AnnotatePage(QWidget):
                 )
                 return
 
-            # YOLO格式数据集导出
-            labels_dir = os.path.join(dataset_dir, 'labels')
-            os.makedirs(labels_dir, exist_ok=True)
+            # ==================== YOLO 格式按结构与比例划分导出 ====================
+            structure_mode = structure_mode or "default"
+            do_shuffle = bool(shuffle)
 
+            valid_images = [
+                img for img in images
+                if img.get('storage_path') and os.path.exists(img['storage_path'])
+            ]
+            if not valid_images:
+                QMessageBox.warning(self, "导出失败", "项目中没有可用的图片文件")
+                return
+
+            # 清理目标目录下可能残留的旧结构子目录，确保两种结构切换重新导出时不混杂
+            for stale_sub in ('images', 'labels', 'train', 'val'):
+                stale_path = os.path.join(dataset_dir, stale_sub)
+                if os.path.isdir(stale_path):
+                    shutil.rmtree(stale_path)
+
+            if structure_mode == "server":
+                # 服务器结构:
+                # ├── train/{images, labels}
+                # └── val/{images, labels}
+                train_img_dir = os.path.join(dataset_dir, 'train', 'images')
+                train_lbl_dir = os.path.join(dataset_dir, 'train', 'labels')
+                val_img_dir = os.path.join(dataset_dir, 'val', 'images')
+                val_lbl_dir = os.path.join(dataset_dir, 'val', 'labels')
+                yaml_train_rel = "train/images"
+                yaml_val_rel = "val/images"
+                structure_desc = "服务器结构 (train/images, val/images)"
+            else:
+                # 默认结构:
+                # ├── images/{train, val}
+                # └── labels/{train, val}
+                train_img_dir = os.path.join(dataset_dir, 'images', 'train')
+                val_img_dir = os.path.join(dataset_dir, 'images', 'val')
+                train_lbl_dir = os.path.join(dataset_dir, 'labels', 'train')
+                val_lbl_dir = os.path.join(dataset_dir, 'labels', 'val')
+                yaml_train_rel = "images/train"
+                yaml_val_rel = "images/val"
+                structure_desc = "默认结构 (images/train, labels/train)"
+
+            for d in (train_img_dir, train_lbl_dir, val_img_dir, val_lbl_dir):
+                os.makedirs(d, exist_ok=True)
+
+            train_images, val_images = self._split_dataset_images(
+                valid_images,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                shuffle=do_shuffle,
+            )
+
+            copied_count = 0
             exported_count = 0
             negative_count = 0
-            for image in images:
-                image_id = image['id']
-                annotations = db.get_image_annotations(image_id)
-                image_status = image.get('status', 'pending')
 
-                if annotations or image_status == 'annotated':
-                    filename = os.path.splitext(image['filename'])[0] + '.txt'
-                    label_file = os.path.join(labels_dir, filename)
-                    lines = self._format_yolo_annotation_lines(
-                        annotations,
-                        image.get('width', 1920),
-                        image.get('height', 1080),
-                    )
-                    with open(label_file, 'w', encoding='utf-8') as f:
-                        for line in lines:
-                            f.write(line + '\n')
+            def _export_subset(subset_imgs: List[Dict], img_out_dir: str, lbl_out_dir: str):
+                nonlocal copied_count, exported_count, negative_count
+                for image in subset_imgs:
+                    src_image = image['storage_path']
+                    dst_image = os.path.join(img_out_dir, image['filename'])
+                    shutil.copy2(src_image, dst_image)
+                    copied_count += 1
 
-                    exported_count += 1
-                    if not annotations:
-                        negative_count += 1
+                    image_id = image['id']
+                    annotations = db.get_image_annotations(image_id)
+                    image_status = image.get('status', 'pending')
+                    if annotations or image_status == 'annotated':
+                        txt_name = os.path.splitext(image['filename'])[0] + '.txt'
+                        label_file = os.path.join(lbl_out_dir, txt_name)
+                        lines = self._format_yolo_annotation_lines(
+                            annotations,
+                            image.get('width', 1920),
+                            image.get('height', 1080),
+                        )
+                        with open(label_file, 'w', encoding='utf-8') as f:
+                            for line in lines:
+                                f.write(line + '\n')
+                        exported_count += 1
+                        if not annotations:
+                            negative_count += 1
+
+            _export_subset(train_images, train_img_dir, train_lbl_dir)
+            _export_subset(val_images, val_img_dir, val_lbl_dir)
 
             classes_file = os.path.join(dataset_dir, 'classes.txt')
             sorted_classes = sorted(self.classes, key=lambda x: x['id'])
@@ -6439,14 +6598,22 @@ class AnnotatePage(QWidget):
                     f.write(f"{cls['name']}\n")
 
             yaml_file = os.path.join(dataset_dir, 'data.yaml')
-            yaml_content = (
-                f"path: {os.path.abspath(dataset_dir)}\n"
-                "train: images\n"
-                "val: images\n"
-                "test: images\n\n"
-                f"nc: {len(sorted_classes)}\n"
-                f"names: {[cls['name'] for cls in sorted_classes]}\n"
-            )
+            if structure_mode == "server":
+                # 服务器结构省略本机绝对路径，上传远端服务器后可直接用于训练
+                yaml_content = (
+                    f"train: {yaml_train_rel}\n"
+                    f"val: {yaml_val_rel}\n\n"
+                    f"nc: {len(sorted_classes)}\n"
+                    f"names: {[cls['name'] for cls in sorted_classes]}\n"
+                )
+            else:
+                yaml_content = (
+                    f"path: {os.path.abspath(dataset_dir)}\n"
+                    f"train: {yaml_train_rel}\n"
+                    f"val: {yaml_val_rel}\n\n"
+                    f"nc: {len(sorted_classes)}\n"
+                    f"names: {[cls['name'] for cls in sorted_classes]}\n"
+                )
             with open(yaml_file, 'w', encoding='utf-8') as f:
                 f.write(yaml_content)
 
@@ -6454,9 +6621,9 @@ class AnnotatePage(QWidget):
                 self,
                 "导出成功",
                 f"已导出 YOLO 完整数据集到\n{dataset_dir}\n\n"
-                f"- 复制图片: {copied_count} 张\n"
-                f"- 导出标注: {exported_count} 个\n"
-                f"- 负样本空标签: {negative_count} 个"
+                f"- 目录结构: {structure_desc}\n"
+                f"- 划分比例: {train_ratio}:{val_ratio}（训练集 {len(train_images)} 张 / 验证集 {len(val_images)} 张）\n"
+                f"- 导出标签: {exported_count} 个（含负样本空标签 {negative_count} 个）"
             )
                 
         except Exception as e:
