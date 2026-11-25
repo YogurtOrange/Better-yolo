@@ -245,7 +245,7 @@ class ClassSyncAndEmptyPresetTests(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(app_info.APP_VERSION, m.group(1))
         self.assertEqual(app_info.LAST_UPDATED, m.group(2))
-        self.assertEqual(app_info.APP_VERSION, "1.0.4")
+        self.assertRegex(app_info.APP_VERSION, r"^\d+\.\d+\.\d+$")
 
 
 if __name__ == '__main__':

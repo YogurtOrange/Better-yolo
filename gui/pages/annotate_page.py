@@ -1058,7 +1058,10 @@ class AnnotationCanvas(QFrame):
         # 顶部中央徽标
         font = ui_font("Microsoft YaHei", 11, QFont.Weight.Bold)
         painter.setFont(font)
-        text = "🔒 已锁定 · 人工修改过 · AI不再标注此图"
+        if getattr(self, 'image_modified', False):
+            text = "✏️🔒 已复标修正并锁定 · AI不再覆盖此图"
+        else:
+            text = "🔒 已确认锁定 · AI不再覆盖此图"
         fm = painter.fontMetrics()
         w = fm.horizontalAdvance(text) + 28
         h = fm.height() + 14
@@ -1576,7 +1579,9 @@ class AnnotationCanvas(QFrame):
                                 self.dragging_vertex = True
                                 self.drag_vertex_index = vertex_idx
                                 self.drag_start = event.pos()
-                                self.drag_start_annotation = None
+                                self.drag_start_annotation = {
+                                    'points': [p.copy() for p in ann_data.get('points', [])]
+                                }
                                 self.annotation_selected.emit(self.selected_annotation_id)
                                 self.update()
                                 return
@@ -1726,31 +1731,35 @@ class AnnotationCanvas(QFrame):
                 self.drawing = False
                 self.create_obb_annotation()
             elif self.resizing:
+                start_rect = self.resize_start_rect
                 self.resizing = False
                 self.resize_handle = None
                 self.resize_start_rect = None
-                # 发送修改信号
+                # 仅在尺寸实际发生变化时发送修改信号
                 if self.selected_annotation_id is not None:
                     annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
-                    if annotation:
+                    if annotation and annotation.get('data') != start_rect:
                         self.annotation_modified.emit(self.selected_annotation_id, annotation['data'])
             elif self.dragging_vertex:
+                start_ann = self.drag_start_annotation
                 self.dragging_vertex = False
                 self.drag_vertex_index = None
                 self.drag_start = None
-                # 发送修改信号
+                self.drag_start_annotation = None
+                # 仅在顶点坐标实际发生变化时发送修改信号
                 if self.selected_annotation_id is not None:
                     annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
-                    if annotation:
+                    if annotation and annotation.get('data') != start_ann:
                         self.annotation_modified.emit(self.selected_annotation_id, annotation['data'])
             elif self.dragging:
+                start_ann = self.drag_start_annotation
                 self.dragging = False
                 self.drag_start = None
                 self.drag_start_annotation = None
-                # 发送修改信号
+                # 仅在框位置实际拖动变化时发送修改信号（避免单击选中即误触发锁定）
                 if self.selected_annotation_id is not None:
                     annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
-                    if annotation:
+                    if annotation and annotation.get('data') != start_ann:
                         self.annotation_modified.emit(self.selected_annotation_id, annotation['data'])
             elif self.panning:
                 self.panning = False
@@ -2499,6 +2508,7 @@ class AnnotatePage(QWidget):
         self.sam_memory_dialog = None
         self.prev_image_shortcut = None
         self.next_image_shortcut = None
+        self.lock_image_shortcut = None
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.timeout.connect(self._on_auto_save_tick)
         
@@ -2582,7 +2592,7 @@ class AnnotatePage(QWidget):
             self.show_save_feedback(f"已自动保存 ({saved})")
 
     def _init_navigation_shortcuts(self):
-        """初始化翻页快捷键，避免依赖控件焦点。"""
+        """初始化翻页与整图锁定快捷键，避免依赖控件焦点。"""
         self.prev_image_shortcut = QShortcut(QKeySequence(), self)
         self.prev_image_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.prev_image_shortcut.activated.connect(self._trigger_prev_image_shortcut)
@@ -2591,17 +2601,25 @@ class AnnotatePage(QWidget):
         self.next_image_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.next_image_shortcut.activated.connect(self._trigger_next_image_shortcut)
 
+        self.lock_image_shortcut = QShortcut(QKeySequence(), self)
+        self.lock_image_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.lock_image_shortcut.activated.connect(self._trigger_lock_image_shortcut)
+
         self._refresh_navigation_shortcuts()
 
     def _refresh_navigation_shortcuts(self):
-        """读取设置中的翻页快捷键。"""
+        """读取设置中的翻页与整图锁定快捷键。"""
         from PyQt6.QtCore import QSettings
 
         settings = QSettings("Better-YOLO", "Settings")
         prev_image_key = str(settings.value("prev_image_shortcut", "A")).upper()
         next_image_key = str(settings.value("next_image_shortcut", "D")).upper()
+        lock_image_key = str(settings.value("lock_image_shortcut", "L")).upper()
         self.prev_image_shortcut.setKey(QKeySequence(prev_image_key))
         self.next_image_shortcut.setKey(QKeySequence(next_image_key))
+        if self.lock_image_shortcut is not None:
+            self.lock_image_shortcut.setKey(QKeySequence(lock_image_key))
+        self._update_lock_button_state_image()
 
     def _should_handle_navigation_shortcut(self) -> bool:
         """在当前焦点状态下是否允许触发翻页快捷键。"""
@@ -2630,6 +2648,11 @@ class AnnotatePage(QWidget):
         """下一张快捷键入口。"""
         if self._should_handle_navigation_shortcut():
             self.next_image()
+
+    def _trigger_lock_image_shortcut(self):
+        """整图锁定/解锁快捷键入口。"""
+        if self._should_handle_navigation_shortcut() and self.current_image_id:
+            self.on_toggle_lock()
 
     def create_left_panel(self) -> QWidget:
         """创建左侧面板 - 图片列表"""
@@ -2667,7 +2690,7 @@ class AnnotatePage(QWidget):
         
         # 筛选
         self.image_filter = QComboBox()
-        self.image_filter.addItems(["全部", "未标注", "已标注"])
+        self.image_filter.addItems(["全部", "未标注", "已标注", "待复核", "已锁定", "已复标修正"])
         self.image_filter.currentTextChanged.connect(self.filter_images)
         layout.addWidget(self.image_filter)
         
@@ -3147,12 +3170,14 @@ class AnnotatePage(QWidget):
         class_button_row.addWidget(self.btn_apply_attr, 1)
         class_layout.addLayout(class_button_row)
 
-        # 锁定 / 手动保存 (针对选中的标注)
+        # 整图锁定 / 手动保存
         self.btn_lock = QPushButton("🔒 锁定本图")
         self.btn_lock.setToolTip(
-            "锁定/解锁当前整张图。\n"
-            "锁定的图AI标注时整图跳过。\n"
-            "手动增删改任何框都会自动锁定本图"
+            "锁定/解锁当前整张图片（默认快捷键 L）。\n"
+            "• 已锁定的图片在 AI/YOLO 批量标注时自动跳过，并可作为正样本示例；\n"
+            "• 手动增/删/改任何标注框或修改类别都会自动锁定本图；\n"
+            "• 若本图经过 AI 标注且人工修改了结果，将额外记录为 ✏️ 复标修正；\n"
+            "• 解锁本图会同时将其移出 AI 断点，便于单独重新跑 AI 标注。"
         )
         self.btn_lock.setFixedHeight(compact_action_button_height)
         self.btn_lock.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -3429,6 +3454,24 @@ class AnnotatePage(QWidget):
             self.load_thread.wait()
             delattr(self, 'load_thread')
     
+    @staticmethod
+    def _format_image_list_text(image: dict) -> str:
+        """格式化左侧图片列表项的状态徽标与文件名:
+        ○ 未标注 | ✓ 待复核 | ✓ 🔒 已确认锁定 | ✓ ✏️🔒 已复标修正并锁定
+        """
+        status_text = "✓" if image.get('status') == 'annotated' else "○"
+        locked = bool(image.get('locked'))
+        modified = bool(image.get('modified'))
+        if locked and modified:
+            badge = " ✏️🔒"
+        elif locked:
+            badge = " 🔒"
+        elif modified:
+            badge = " ✏️"
+        else:
+            badge = ""
+        return f"{status_text}{badge} {image['filename']}"
+
     def load_image_list(self):
         """加载图片列表 - 使用多线程"""
         # 停止之前的加载
@@ -3450,14 +3493,11 @@ class AnnotatePage(QWidget):
         for image in self.images:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, image['id'])
-            
-            # 设置显示文本
-            status_text = "✓" if image.get('status') == 'annotated' else "○"
-            lock_text = " 🔒" if image.get('locked') else ""
-            mod_text = " ✏️" if image.get('modified') else ""
-            item.setText(f"{status_text}{lock_text}{mod_text} {image['filename']}")
-            
+            item.setText(self._format_image_list_text(image))
             self.image_list.addItem(item)
+
+        if hasattr(self, 'image_filter'):
+            self.filter_images(self.image_filter.currentText())
         
         self.update_status_bar()
         self.update_sample_control_panel()
@@ -3485,20 +3525,18 @@ class AnnotatePage(QWidget):
         # 重新加载图片数据
         if self.current_project_id:
             self.images = db.get_project_images(self.current_project_id)
+            img_map = {img['id']: img for img in self.images}
             
             # 更新图片列表项
             for i in range(self.image_list.count()):
                 item = self.image_list.item(i)
                 image_id = item.data(Qt.ItemDataRole.UserRole)
-                
-                # 找到对应的图片数据
-                image_data = next((img for img in self.images if img['id'] == image_id), None)
+                image_data = img_map.get(image_id)
                 if image_data:
-                    # 更新显示文本
-                    status_text = "✓" if image_data.get('status') == 'annotated' else "○"
-                    lock_text = " 🔒" if image_data.get('locked') else ""
-                    mod_text = " ✏️" if image_data.get('modified') else ""
-                    item.setText(f"{status_text}{lock_text}{mod_text} {image_data['filename']}")
+                    item.setText(self._format_image_list_text(image_data))
+
+            if hasattr(self, 'image_filter'):
+                self.filter_images(self.image_filter.currentText())
     
     def refresh_classes(self):
         """从数据库重新加载类别并刷新列表(AI标注页添加标签后同步)"""
@@ -4447,9 +4485,14 @@ class AnnotatePage(QWidget):
                                 modified_count += 1
                                 img_modified = True
 
-                # 批量修改过的图整图锁定,AI不再处理
+                # 批量修改过的图按AI快照差异同步整图锁定与复标状态
                 if img_modified:
-                    self._mark_image_modified(image_id)
+                    remaining = db.get_image_annotations(image_id)
+                    if not remaining and db.get_image_ai_original(image_id) is None:
+                        db.update_image_status(image_id, 'pending')
+                        self._sync_image_review_state(image_id, lock=False)
+                    else:
+                        self._sync_image_review_state(image_id, lock=True)
 
                 processed_count += 1
             
@@ -4838,16 +4881,17 @@ class AnnotatePage(QWidget):
     
     def filter_images(self, filter_text: str):
         """筛选图片"""
+        img_map = {img['id']: img for img in self.images}
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
             image_id = item.data(Qt.ItemDataRole.UserRole)
-            
-            # 找到对应的图片数据
-            image_data = next((img for img in self.images if img['id'] == image_id), None)
+            image_data = img_map.get(image_id)
             if not image_data:
                 continue
             
             status = image_data.get('status', 'pending')
+            locked = bool(image_data.get('locked'))
+            modified = bool(image_data.get('modified'))
             
             if filter_text == "全部":
                 item.setHidden(False)
@@ -4855,6 +4899,12 @@ class AnnotatePage(QWidget):
                 item.setHidden(status != 'pending')
             elif filter_text == "已标注":
                 item.setHidden(status == 'pending')
+            elif filter_text == "待复核":
+                item.setHidden(not (status == 'annotated' and not locked))
+            elif filter_text == "已锁定":
+                item.setHidden(not locked)
+            elif filter_text == "已复标修正":
+                item.setHidden(not modified)
     
     def on_image_selected(self, item: QListWidgetItem):
         """图片选中事件"""
@@ -4945,13 +4995,15 @@ class AnnotatePage(QWidget):
 
         self.annotations = db.get_image_annotations(self.current_image_id)
 
-        # 同步整图锁定状态(画布横幅+按钮)
+        # 同步整图锁定与复标修正状态(画布横幅+按钮)
         img = next(
             (i for i in self.images if i['id'] == self.current_image_id),
             None
         )
         locked = bool(img and img.get('locked'))
+        modified = bool(img and img.get('modified'))
         self.canvas.image_locked = locked
+        self.canvas.image_modified = modified
         self._update_lock_button_state_image()
 
         self.canvas.set_annotations(self.annotations)
@@ -4959,7 +5011,9 @@ class AnnotatePage(QWidget):
         self._refresh_annotation_class_controls()
 
     def _update_lock_button_state_image(self):
-        """按当前图片的整图锁定状态更新按钮"""
+        """按当前图片的整图锁定状态更新按钮（始终只代表整张图片，不被单框选中状态覆盖）"""
+        if not hasattr(self, 'btn_lock'):
+            return
         img = next(
             (i for i in self.images if i['id'] == self.current_image_id),
             None
@@ -4968,27 +5022,62 @@ class AnnotatePage(QWidget):
         self.btn_lock.setText("🔓 解锁本图" if locked else "🔒 锁定本图")
         self.btn_lock.setEnabled(bool(self.current_image_id))
 
-    def _mark_image_modified(self, image_id: int = None):
-        """手动修改过标注(增/删/改)后锁定整张图并标记已修正,
-        AI不再处理此图，且该图会进入"修正对比反馈"流程"""
+    def _sync_image_review_state(self, image_id: int = None, lock: Optional[bool] = True):
+        """统一同步图片的整图锁定(locked)与人工复标修正(modified)状态。
+
+        Args:
+            image_id: 目标图片ID，默认为当前打开图片
+            lock:
+                - True: 人工编辑后自动锁定整张图(方案 A)
+                - False: 显式解锁整张图，同时清空 modified
+                - None: 保持现有 locked 状态不变，仅按 AI 快照重算 modified（例如撤销操作）
+        """
+        from core.qwen_annotator import compute_image_ai_modified
+
         image_id = image_id or self.current_image_id
         if not image_id:
             return
+
         try:
-            db.set_image_locked(image_id, True)
-            db.set_image_modified(image_id, True)
+            if lock is True:
+                db.set_image_locked(image_id, True)
+                is_modified = compute_image_ai_modified(image_id)
+                db.set_image_modified(image_id, is_modified)
+                target_locked = True
+            elif lock is False:
+                db.set_image_locked(image_id, False)
+                db.set_image_modified(image_id, False)
+                target_locked = False
+                is_modified = False
+            else:
+                img_row = db.get_image(image_id)
+                target_locked = bool(img_row and img_row.get('locked'))
+                is_modified = compute_image_ai_modified(image_id) if target_locked else False
+                db.set_image_modified(image_id, is_modified)
         except Exception:
             return
+
+        fresh_img = db.get_image(image_id)
         for img in self.images:
             if img['id'] == image_id:
-                img['locked'] = 1
-                img['modified'] = 1
+                img['locked'] = 1 if target_locked else 0
+                img['modified'] = 1 if is_modified else 0
+                if fresh_img:
+                    img['status'] = fresh_img.get('status', img.get('status'))
                 break
+
         self.update_image_list_display()
         if image_id == self.current_image_id:
-            self.canvas.image_locked = True
+            if fresh_img:
+                self.current_image_data = fresh_img
+            self.canvas.image_locked = target_locked
+            self.canvas.image_modified = is_modified
             self._update_lock_button_state_image()
             self.canvas.update()
+
+    def _mark_image_modified(self, image_id: int = None):
+        """兼容入口: 人工修改标注后按方案 A 自动锁定本图，并根据 AI 快照计算是否标记为 ✏️ 复标修正"""
+        self._sync_image_review_state(image_id=image_id, lock=True)
     
     def set_tool(self, tool: str):
         """设置工具"""
@@ -5023,9 +5112,12 @@ class AnnotatePage(QWidget):
         self.history = []
         self.history_index = -1
         self.canvas.selected_annotation_id = None
+        self.canvas.image_locked = False
+        self.canvas.image_modified = False
         self.canvas.set_annotations([])
         self.canvas.load_image("")
         self.clear_attribute_panel(refresh_sample_panel=False)
+        self._update_lock_button_state_image()
         self.update_status_bar()
         self.update_delete_menu_state()
 
@@ -5112,14 +5204,17 @@ class AnnotatePage(QWidget):
                 class_id = matched_cls['id']
             class_name = matched_cls['name']
         
-        # 保存到数据库
+        # 保存到数据库（标记为人工创建）
+        attrs = dict(annotation.get('attributes') or {})
+        attrs.setdefault('source', 'manual')
         ann_id = db.add_annotation(
             image_id=self.current_image_id,
             project_id=self.current_project_id,
             class_id=class_id,
             class_name=class_name,
             annotation_type=annotation['type'],
-            data=annotation['data']
+            data=annotation['data'],
+            attributes=attrs,
         )
         
         # 添加到历史记录
@@ -5128,8 +5223,8 @@ class AnnotatePage(QWidget):
         # 更新图片状态为已标注
         db.update_image_status(self.current_image_id, 'annotated')
 
-        # 手动画的框 = 整张图锁定,AI不再处理此图
-        self._mark_image_modified()
+        # 方案 A: 手动画框自动锁定整张图；仅在偏离 AI 快照时标记为 ✏️
+        self._sync_image_review_state(self.current_image_id, lock=True)
         
         # 重新加载标注
         self.load_annotations()
@@ -5148,28 +5243,42 @@ class AnnotatePage(QWidget):
     
     def on_annotation_modified(self, annotation_id: int, data: dict):
         """标注修改事件（拖动或调整大小后）"""
+        import copy
+
+        old_record = db.get_annotation(annotation_id)
+        if not old_record:
+            return
+        old_data = copy.deepcopy(old_record.get('data') or {})
+        old_attrs = copy.deepcopy(old_record.get('attributes') or {})
+        if old_data == data:
+            return
+
+        # 更新数据库中的标注并锁定该框
+        db.update_annotation(annotation_id, data=data)
+        db.set_annotation_locked(annotation_id, True)
+
         annotation = next((ann for ann in self.annotations if ann['id'] == annotation_id), None)
         if annotation:
-            # 更新数据库中的标注
-            db.update_annotation(annotation_id, data=data)
-
-            # 人工修改过的框自动锁定，AI重标时不再替换
-            db.set_annotation_locked(annotation_id, True)
+            annotation['data'] = copy.deepcopy(data)
             attrs = dict(annotation.get('attributes') or {})
             attrs['locked'] = True
             annotation['attributes'] = attrs
-
-            # 改了一部分 = 整张图锁定,AI不再处理此图
-            self._mark_image_modified()
-
-            # 更新属性面板
             self.update_attribute_panel(annotation)
 
-            # 添加到历史记录
-            self.add_history('modify', {'annotation_id': annotation_id, 'old_data': data.copy()})
+        # 添加到历史记录（保存修改前的真实坐标与属性，支持 Ctrl+Z 完整回退）
+        self.add_history('modify', {
+            'annotation_id': annotation_id,
+            'old_data': old_data,
+            'old_attributes': old_attrs,
+        })
+
+        # 方案 A: 人工调整框自动锁定本图，并按 AI 快照差异更新 ✏️
+        self._sync_image_review_state(self.current_image_id, lock=True)
 
     def on_toggle_lock(self):
-        """手动锁定/解锁整张图(锁定的图AI标注时整图跳过)"""
+        """手动锁定/解锁整张图（支持按钮点击与快捷键 L）"""
+        from core.qwen_annotator import remove_image_from_breakpoint
+
         if not self.current_image_id:
             QMessageBox.warning(self, "提示", "当前没有打开的图片")
             return
@@ -5181,24 +5290,28 @@ class AnnotatePage(QWidget):
         cur_locked = bool(img and img.get('locked'))
         new_locked = not cur_locked
 
-        db.set_image_locked(self.current_image_id, new_locked)
-        if img:
-            img['locked'] = 1 if new_locked else 0
-        self.canvas.image_locked = new_locked
-        self._update_lock_button_state_image()
-        self.update_image_list_display()
-        self.canvas.update()
-        self.update_status_bar()
+        if new_locked:
+            # 锁定未标注的空图时自动确认为已标注（负样本），避免出现“未标注但已锁定”的矛盾状态
+            if img and img.get('status') != 'annotated':
+                db.update_image_status(self.current_image_id, 'annotated')
+            self._sync_image_review_state(self.current_image_id, lock=True)
+            updated_img = next((i for i in self.images if i['id'] == self.current_image_id), None)
+            if updated_img and updated_img.get('modified'):
+                self.show_save_feedback("已锁定本图（含复标修正）")
+            else:
+                self.show_save_feedback("已确认并锁定本图")
+        else:
+            # 解锁本图：解除整图锁与单框锁，清空 ✏️，并从 AI 断点中移除该图以便单独重标
+            db.clear_image_annotation_locks(self.current_image_id)
+            if self.current_project_id and img and img.get('filename'):
+                project = db.get_project(self.current_project_id)
+                if project and project.get('storage_path'):
+                    remove_image_from_breakpoint(project['storage_path'], img['filename'])
+            self._sync_image_review_state(self.current_image_id, lock=False)
+            self.load_annotations()
+            self.show_save_feedback("已解锁本图（可重新参与AI标注）")
 
-    def _update_lock_button_state(self, annotation):
-        """根据选中标注的锁定状态更新锁定按钮文字"""
-        if annotation is None:
-            self.btn_lock.setText("🔒 锁定")
-            self.btn_lock.setEnabled(False)
-            return
-        locked = (annotation.get('attributes') or {}).get('locked', False)
-        self.btn_lock.setText("🔓 解锁" if locked else "🔒 锁定")
-        self.btn_lock.setEnabled(True)
+        self.update_status_bar()
 
     def on_save_annotations(self):
         """手动保存: 把当前图片的所有标注写入数据库"""
@@ -5223,36 +5336,51 @@ class AnnotatePage(QWidget):
 
     def show_save_feedback(self, text: str):
         """在状态栏显示保存成功的临时提示"""
-        if not hasattr(self, 'status_save'):
+        if not hasattr(self, 'status_save') or self.status_save is None:
             return
         self.status_save.setText(f"✔ {text}")
-        QTimer.singleShot(2000, lambda: self.status_save.setText(""))
+        if not hasattr(self, '_save_feedback_timer'):
+            self._save_feedback_timer = QTimer(self)
+            self._save_feedback_timer.setSingleShot(True)
+            self._save_feedback_timer.timeout.connect(self._clear_save_feedback)
+        self._save_feedback_timer.start(2000)
+
+    def _clear_save_feedback(self):
+        if hasattr(self, 'status_save') and self.status_save is not None:
+            try:
+                self.status_save.setText("")
+            except RuntimeError:
+                pass
     
     def on_annotation_deleted(self, annotation_id: int):
         """标注删除事件"""
+        import copy
+
         # 保存到历史记录
         annotation = next((ann for ann in self.annotations if ann['id'] == annotation_id), None)
         if annotation:
-            self.add_history('delete', annotation)
+            self.add_history('delete', copy.deepcopy(annotation))
         
         # 从数据库删除
         db.delete_annotation(annotation_id)
 
-        # 手动删除框 = 整张图锁定,AI不再处理此图
-        self._mark_image_modified()
-
-        # 重新加载
+        # 重新加载剩余标注
         self.load_annotations()
         self.canvas.selected_annotation_id = None
         self.clear_attribute_panel(refresh_sample_panel=False)
         
-        # 检查图片是否还有标注
+        # 检查图片是否还有标注：
+        # - 若该图无 AI 快照（纯人工图）且删空了全部框，恢复为未标注并解除锁定；
+        # - 若该图有 AI 快照（删空了 AI 误检框），保持已标注（负样本）并锁定 + 标记 ✏️ 复标修正！
         remaining_annotations = self.annotations
-        if not remaining_annotations:
-            # 如果没有标注了，更新状态为未标注
+        has_ai_snapshot = db.get_image_ai_original(self.current_image_id) is not None
+        if not remaining_annotations and not has_ai_snapshot:
             db.update_image_status(self.current_image_id, 'pending')
-            # 更新图片列表显示
-            self.update_image_list_display()
+            self._sync_image_review_state(self.current_image_id, lock=False)
+        else:
+            if has_ai_snapshot:
+                db.update_image_status(self.current_image_id, 'annotated')
+            self._sync_image_review_state(self.current_image_id, lock=True)
 
         self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
@@ -5267,8 +5395,8 @@ class AnnotatePage(QWidget):
         # 设置类别
         class_id = annotation.get('class_id', 0)
         self._set_class_list_selection(class_id)
-        # 更新锁定按钮状态
-        self._update_lock_button_state(annotation)
+        # 始终保持整图锁定按钮状态
+        self._update_lock_button_state_image()
 
     def clear_attribute_panel(self, refresh_sample_panel=True):
         """清空属性面板"""
@@ -5278,8 +5406,7 @@ class AnnotatePage(QWidget):
         self.sample_delete_count.blockSignals(True)
         self.sample_delete_count.setValue(0)
         self.sample_delete_count.blockSignals(False)
-        if hasattr(self, 'btn_lock'):
-            self._update_lock_button_state(None)
+        self._update_lock_button_state_image()
         if refresh_sample_panel:
             self.update_sample_control_panel()
         self._refresh_annotation_class_controls()
@@ -5322,15 +5449,26 @@ class AnnotatePage(QWidget):
             self._refresh_annotation_class_controls()
             return
 
-        # 更新标注数据
-        annotation['class_id'] = class_id
-        annotation['class_name'] = class_name
+        import copy
+        old_class_id = annotation.get('class_id')
+        old_class_name = annotation.get('class_name')
+        old_attrs = copy.deepcopy(annotation.get('attributes') or {})
 
-        # 更新到数据库
+        # 更新到数据库并锁定该框
         updated = db.update_annotation(annotation['id'], class_id=class_id, class_name=class_name)
         if not updated:
             QMessageBox.warning(self, "提示", "标注类别修改失败")
             return
+        db.set_annotation_locked(annotation['id'], True)
+
+        # 记录撤销历史并同步整图锁定与复标状态
+        self.add_history('change_class', {
+            'annotation_id': annotation['id'],
+            'old_class_id': old_class_id,
+            'old_class_name': old_class_name,
+            'old_attributes': old_attrs,
+        })
+        self._sync_image_review_state(self.current_image_id, lock=True)
         
         # 刷新显示
         self.load_annotations()
@@ -5564,12 +5702,15 @@ class AnnotatePage(QWidget):
 
         db.delete_image_annotations(self.current_image_id)
         db.update_image_status(self.current_image_id, 'annotated')
+        # 人工标记为负样本时自动锁定本图；若清空了 AI 误检框则同步标记 ✏️ 复标修正
+        self._sync_image_review_state(self.current_image_id, lock=True)
         self.current_image_data = db.get_image(self.current_image_id)
 
         self.load_annotations()
         self.canvas.selected_annotation_id = None
         self.clear_attribute_panel(refresh_sample_panel=False)
         self.update_image_list_display()
+        self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
 
         _, shortcut_triggered = self._exec_message_box_with_shortcut(
@@ -5670,13 +5811,22 @@ class AnnotatePage(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        # 删除项目内该类别下的全部标注并重排后续 class_id
+        # 删除项目内该类别下的全部标注并重排后续 class_id，同时同步受影响图片的锁定与复标状态
+        affected_img_ids = set()
         if self.current_project_id:
+            for img in self.images:
+                anns = db.get_image_annotations(img['id'])
+                if any(ann.get('class_id') == class_id for ann in anns):
+                    affected_img_ids.add(img['id'])
             db.delete_project_class_and_reindex(self.current_project_id, class_id)
 
-        # 若当前图曾包含该类标注，视为手动修改并锁定本图
-        if any(ann.get('class_id') == class_id for ann in self.annotations):
-            self._mark_image_modified()
+        for img_id in affected_img_ids:
+            remaining = db.get_image_annotations(img_id)
+            if not remaining and db.get_image_ai_original(img_id) is None:
+                db.update_image_status(img_id, 'pending')
+                self._sync_image_review_state(img_id, lock=False)
+            else:
+                self._sync_image_review_state(img_id, lock=True)
 
         # 从列表中删除类别并重新编号
         self.classes = [c for c in self.classes if c['id'] != class_id]
@@ -5727,24 +5877,28 @@ class AnnotatePage(QWidget):
             self.classes_changed.emit({'action': 'add', 'name': name})
     
     def prev_image(self):
-        """上一张图片"""
+        """上一张图片（优先在当前筛选可见项中跳转）"""
         if not self.images or not self.current_image_id:
             return
         
         current_index = next((i for i, img in enumerate(self.images) if img['id'] == self.current_image_id), 0)
-        if current_index > 0:
-            new_image_id = self.images[current_index - 1]['id']
-            self.load_image(new_image_id)
+        for idx in range(current_index - 1, -1, -1):
+            item = self.image_list.item(idx) if idx < self.image_list.count() else None
+            if item is None or not item.isHidden():
+                self.load_image(self.images[idx]['id'])
+                return
     
     def next_image(self):
-        """下一张图片"""
+        """下一张图片（优先在当前筛选可见项中跳转）"""
         if not self.images or not self.current_image_id:
             return
         
         current_index = next((i for i, img in enumerate(self.images) if img['id'] == self.current_image_id), -1)
-        if current_index < len(self.images) - 1:
-            new_image_id = self.images[current_index + 1]['id']
-            self.load_image(new_image_id)
+        for idx in range(current_index + 1, len(self.images)):
+            item = self.image_list.item(idx) if idx < self.image_list.count() else None
+            if item is None or not item.isHidden():
+                self.load_image(self.images[idx]['id'])
+                return
     
     def add_history(self, action: str, data: dict):
         """添加历史记录"""
@@ -5764,7 +5918,7 @@ class AnnotatePage(QWidget):
             self.history_index -= 1
     
     def undo(self):
-        """撤销"""
+        """撤销（支持创建、删除、移动/缩放、修改类别，并自动重算 AI 复标修正状态）"""
         if self.history_index < 0:
             return
         
@@ -5778,17 +5932,47 @@ class AnnotatePage(QWidget):
             if ann_id:
                 db.delete_annotation(ann_id)
         elif action == 'delete':
-            # 撤销删除 = 创建
+            # 撤销删除 = 恢复创建（保留原 attributes）
             db.add_annotation(
                 image_id=data['image_id'],
                 project_id=data['project_id'],
                 class_id=data['class_id'],
                 class_name=data['class_name'],
                 annotation_type=data['type'],
-                data=data['data']
+                data=data['data'],
+                attributes=data.get('attributes') or {},
             )
+        elif action == 'modify':
+            ann_id = data.get('annotation_id')
+            if ann_id and 'old_data' in data:
+                db.update_annotation(
+                    ann_id,
+                    data=data['old_data'],
+                    attributes=data.get('old_attributes'),
+                )
+        elif action == 'change_class':
+            ann_id = data.get('annotation_id')
+            if ann_id:
+                db.update_annotation(
+                    ann_id,
+                    class_id=data.get('old_class_id'),
+                    class_name=data.get('old_class_name'),
+                    attributes=data.get('old_attributes'),
+                )
         
         self.history_index -= 1
+        if self.current_image_id:
+            remaining = db.get_image_annotations(self.current_image_id)
+            has_ai_snapshot = db.get_image_ai_original(self.current_image_id) is not None
+            if remaining:
+                db.update_image_status(self.current_image_id, 'annotated')
+                self._sync_image_review_state(self.current_image_id, lock=None)
+            elif not has_ai_snapshot:
+                db.update_image_status(self.current_image_id, 'pending')
+                self._sync_image_review_state(self.current_image_id, lock=False)
+            else:
+                self._sync_image_review_state(self.current_image_id, lock=None)
+
         self.load_annotations()
         self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
@@ -5820,6 +6004,7 @@ class AnnotatePage(QWidget):
         rect_tool_key = settings.value("rect_tool_shortcut", "Q").upper()
         poly_tool_key = settings.value("poly_tool_shortcut", "P").upper()
         move_tool_key = settings.value("move_tool_shortcut", "E").upper()
+        lock_image_key = settings.value("lock_image_shortcut", "L").upper()
         delete_key = settings.value("delete_shortcut", "DELETE").upper()
         
         # 处理工具快捷键
@@ -5833,6 +6018,9 @@ class AnnotatePage(QWidget):
         elif key_text == move_tool_key:
             self.btn_move.setChecked(True)
             self.set_tool('move')
+            return
+        elif key_text == lock_image_key and self.current_image_id:
+            self.on_toggle_lock()
             return
         elif AnnotationCanvas._matches_delete_shortcut(event, settings):
             self.delete_selected_annotation()

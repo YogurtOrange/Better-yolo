@@ -23,6 +23,7 @@ import re
 import json
 import time
 import base64
+import hashlib
 import random
 import threading
 import concurrent.futures
@@ -938,6 +939,12 @@ def generate_task_prompt(model, sample_images, example_images,
                 "type": "image_url",
                 "image_url": {"url": info["url"]}
             })
+        elif pair.get("after_path"):
+            content.append({
+                "type": "text",
+                "text": f"对比图组{idx} ({name}) — "
+                        "AI上一轮标注结果: 漏检(输出了0个框)。"
+            })
 
         if pair.get("after_path"):
             info = encode_image(pair["after_path"], megapixels)
@@ -949,6 +956,13 @@ def generate_task_prompt(model, sample_images, example_images,
             content.append({
                 "type": "image_url",
                 "image_url": {"url": info["url"]}
+            })
+        elif pair.get("before_path"):
+            content.append({
+                "type": "text",
+                "text": f"对比图组{idx} ({name}) — "
+                        "用户人工修正后的正确答案: 该图为纯背景负样本(无任何目标)，"
+                        "上一张图中的红框全部是AI误检，请在描述与negative中排除！"
             })
 
     messages = [
@@ -1497,6 +1511,71 @@ def _get_current_bboxes(img_id):
     return bboxes
 
 
+def compute_image_ai_modified(image_id: int, iou_threshold: float = 0.98) -> bool:
+    """对比当前数据库标注与 AI 原始快照(ai_original)，判定是否发生了实质性人工复标修正。
+
+    规则:
+      1. 若 ai_original 为 None（该图从未经过 AI 标注，属于纯人工首标），返回 False（仅锁定，不计入 AI 纠错对比）。
+      2. 若存在非 bbox 类型的标注（多边形/关键点/旋转框），返回 True。
+      3. 若当前有效 bbox 数量与 AI 快照数量不一致（补标漏检、删掉误检、或清空为负样本），返回 True。
+      4. 同类别下按 IoU >= iou_threshold 进行一对一贪心匹配；全部匹配成功视为未发生实质改动（返回 False），否则返回 True。
+    """
+    snapshot = db.get_image_ai_original(image_id)
+    if snapshot is None or not isinstance(snapshot, list):
+        return False
+
+    snap_boxes = []
+    for obj in snapshot:
+        if not isinstance(obj, dict):
+            continue
+        try:
+            bb = [float(v) for v in obj.get("bbox", [])]
+            if len(bb) == 4 and bb[2] - bb[0] > 1 and bb[3] - bb[1] > 1:
+                snap_boxes.append((str(obj.get("class_name") or "").strip(), bb))
+        except (TypeError, ValueError):
+            continue
+
+    annotations = db.get_image_annotations(image_id)
+    curr_boxes = []
+    for ann in annotations:
+        if ann.get("type", "bbox") != "bbox":
+            return True
+        d = ann.get("data") or {}
+        try:
+            x = float(d.get("x", 0))
+            y = float(d.get("y", 0))
+            w = float(d.get("width", 0))
+            h = float(d.get("height", 0))
+        except (TypeError, ValueError):
+            continue
+        if w > 1 and h > 1:
+            curr_boxes.append((str(ann.get("class_name") or "").strip(), [x, y, x + w, y + h]))
+
+    if len(snap_boxes) != len(curr_boxes):
+        return True
+    if not snap_boxes:
+        return False
+
+    candidates = []
+    for i, (cls_s, box_s) in enumerate(snap_boxes):
+        for j, (cls_c, box_c) in enumerate(curr_boxes):
+            if cls_s != cls_c:
+                continue
+            iou = bbox_iou(box_s, box_c)
+            if iou >= iou_threshold:
+                candidates.append((iou, i, j))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    used_s = set()
+    used_c = set()
+    for _, i, j in candidates:
+        if i not in used_s and j not in used_c:
+            used_s.add(i)
+            used_c.add(j)
+
+    return len(used_s) != len(snap_boxes)
+
+
 def export_modified_comparison(project_id, only_ids=None, log=print):
     """导出"AI原始结果 vs 用户修正结果"对比图组
 
@@ -1626,11 +1705,25 @@ def register_classes(project_id, class_names):
 # progress: 进度回调 progress(done, total)
 # ============================================================
 
+def compute_ai_task_signature(prompt: str, negative: str = "", example_paths=None) -> str:
+    """计算当前 AI 标注任务配置的摘要指纹，用于判断提示词/负样本/示例是否较上一轮发生变化"""
+    norm_prompt = (prompt or "").strip()
+    norm_neg = (negative or "").strip()
+    norm_examples = sorted(Path(p).name for p in (example_paths or []) if p)
+    payload = json.dumps(
+        {"prompt": norm_prompt, "negative": norm_neg, "examples": norm_examples},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def run_ai_annotation(params, log, stop_event=None, progress=None):
 
     project_id = params["project_id"]
     all_records = params["images"]
-    prompt = params.get("prompt", "")
+    raw_prompt = (params.get("prompt", "") or "").strip()
+    prompt = raw_prompt
     model = params.get("model", DEFAULT_MODEL)
     api_key = params.get("api_key", "")
     base_url = params.get("base_url", BASE_URL)
@@ -1749,15 +1842,20 @@ def run_ai_annotation(params, log, stop_event=None, progress=None):
 
     # ===== 断点文件 =====
 
+    task_signature = compute_ai_task_signature(raw_prompt, negative, example_paths)
     progress_file = project_dir / "ai_progress.json"
 
     if progress_file.exists():
-        with open(progress_file, "r", encoding="utf-8") as f:
-            progress_data = json.load(f)
+        try:
+            with open(progress_file, "r", encoding="utf-8") as f:
+                progress_data = json.load(f) or {}
+        except Exception:
+            progress_data = {}
     else:
-        progress_data = {"completed": []}
+        progress_data = {}
 
-    completed = set(progress_data["completed"])
+    completed = set(progress_data.get("completed") or [])
+    saved_signature = progress_data.get("task_signature")
 
     # ===== 图片列表 =====
 
@@ -1766,13 +1864,26 @@ def run_ai_annotation(params, log, stop_event=None, progress=None):
         if Path(r.get('storage_path') or '').suffix.lower() in IMAGE_EXTENSIONS
     ]
 
-    # 人工锁定(手动修改过)的图片整图跳过,不交给AI
+    # 人工锁定(手动确认/复标修正过)的图片整图跳过,不交给AI
     locked_records = [r for r in records if r.get('locked')]
     if locked_records:
         log(f"[跳过] {len(locked_records)} 张图片已人工锁定,不参与AI标注")
     records = [r for r in records if not r.get('locked')]
 
     total_all = len(records)
+
+    # 多轮迭代闭环支持:
+    # 1) 若提示词/负样本/示例指纹较上一轮已变更，旧断点作废，对全部未锁定图片重新标定；
+    # 2) 若用户勾选了“覆盖已有标注”且旧断点已覆盖全部未锁定图片(或无指纹旧断点)，自动重置断点重标未锁定图片。
+    if completed and saved_signature and saved_signature != task_signature:
+        log("[自动重标] 检测到提示词/负样本或示例已更新，已自动重置上一轮断点，将重新标定未锁定图片")
+        completed.clear()
+    elif completed and overwrite and (
+        saved_signature != task_signature
+        or (records and all(r['filename'] in completed for r in records))
+    ):
+        log("[覆盖重标] 已开启覆盖已有标注，自动重置上一轮断点并重新标定全部未锁定图片")
+        completed.clear()
 
     records = [
         r for r in records
@@ -1975,6 +2086,9 @@ def run_ai_annotation(params, log, stop_event=None, progress=None):
                     {'source': 'ai', 'confidence': obj.get('confidence', 1.0)}
                 )
 
+            if not objects:
+                db.update_image_status(record['id'], 'annotated')
+
             # 保存AI原始框快照(用户之后人工修正时，
             # 用于生成"AI原始结果 vs 修正结果"对比图反馈)
             try:
@@ -1985,6 +2099,7 @@ def run_ai_annotation(params, log, stop_event=None, progress=None):
                     }
                     for o in objects
                 ])
+                db.set_image_modified(record['id'], False)
             except Exception as e:
                 log(f"[警告] AI快照保存失败({record['filename']}): {e}")
 
@@ -1993,8 +2108,13 @@ def run_ai_annotation(params, log, stop_event=None, progress=None):
 
             with open(progress_file, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"completed": list(completed)},
-                    f, indent=4
+                    {
+                        "completed": sorted(completed),
+                        "task_signature": task_signature,
+                    },
+                    f,
+                    indent=4,
+                    ensure_ascii=False,
                 )
 
             done += 1
@@ -2035,3 +2155,24 @@ def clear_breakpoint(project_dir):
         progress_file.unlink()
         return True
     return False
+
+
+def remove_image_from_breakpoint(project_dir, filename: str) -> bool:
+    """从项目 AI 断点记录(ai_progress.json)中移除单张图片，使其解锁后可单独重标"""
+    if not project_dir or not filename:
+        return False
+    progress_file = Path(project_dir) / "ai_progress.json"
+    if not progress_file.exists():
+        return False
+    try:
+        with open(progress_file, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        completed = list(data.get("completed") or [])
+        if filename not in completed:
+            return False
+        data["completed"] = [fn for fn in completed if fn != filename]
+        with open(progress_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception:
+        return False

@@ -227,6 +227,18 @@ class SettingsPage(QWidget):
         next_layout.addWidget(btn_set_next)
         
         layout.addRow("下一张图片:", next_layout)
+
+        # 锁定/解锁本图快捷键
+        lock_layout = QHBoxLayout()
+        self.lock_image_shortcut = QLabel(self.settings.value("lock_image_shortcut", "L"))
+        self.lock_image_shortcut.setStyleSheet(f"background-color: {COLORS['background']}; padding: 8px; border-radius: 6px;")
+        lock_layout.addWidget(self.lock_image_shortcut, 1)
+
+        btn_set_lock = QPushButton("设置")
+        btn_set_lock.clicked.connect(lambda: self.set_shortcut("lock_image_shortcut", self.lock_image_shortcut))
+        lock_layout.addWidget(btn_set_lock)
+
+        layout.addRow("锁定/解锁本图:", lock_layout)
         
         # 删除标注快捷键
         delete_layout = QHBoxLayout()
@@ -318,6 +330,8 @@ class SettingsPage(QWidget):
             self.prev_image_shortcut.setText("A")
         if hasattr(self, 'next_image_shortcut'):
             self.next_image_shortcut.setText("D")
+        if hasattr(self, 'lock_image_shortcut'):
+            self.lock_image_shortcut.setText("L")
         if hasattr(self, 'delete_shortcut'):
             self.delete_shortcut.setText("DELETE")
         
@@ -331,6 +345,7 @@ class SettingsPage(QWidget):
         self.settings.setValue("move_tool_shortcut", "E")
         self.settings.setValue("prev_image_shortcut", "A")
         self.settings.setValue("next_image_shortcut", "D")
+        self.settings.setValue("lock_image_shortcut", "L")
         self.settings.setValue("delete_shortcut", "DELETE")
         self.settings_saved.emit()
         

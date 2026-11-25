@@ -39,6 +39,7 @@ from core.qwen_annotator import (
     generate_task_prompt,
     fetch_available_models,
     clear_breakpoint,
+    compute_ai_task_signature,
     normalize_prompt_lines,
     parse_category_list,
     export_manual_examples,
@@ -468,14 +469,20 @@ class ModifiedImagesDialog(QDialog):
     # -------------------- 数据与渲染 --------------------
 
     def _load_images(self, project_id):
-        images = [
-            i for i in db.get_project_images(project_id)
-            if i.get('modified')
-        ]
+        from core.qwen_annotator import compute_image_ai_modified
+
+        images = []
+        for img in db.get_project_images(project_id):
+            if not img.get('modified'):
+                continue
+            # 自动清理历史遗留的“纯手标无AI快照却被误标 modified=1”的脏标记
+            if img.get('ai_original') is None or not compute_image_ai_modified(img['id']):
+                db.set_image_modified(img['id'], False)
+                continue
+            images.append(img)
+
         for img in images:
-            has_snap = bool(img.get('ai_original'))
-            badge = "✏️ " if has_snap else "✏️(无AI快照) "
-            item = QListWidgetItem(f"{badge}{img['filename']}")
+            item = QListWidgetItem(f"✏️ {img['filename']}")
             item.setData(Qt.ItemDataRole.UserRole, img['id'])
             item.setData(
                 Qt.ItemDataRole.UserRole + 1, img['storage_path']
@@ -484,9 +491,9 @@ class ModifiedImagesDialog(QDialog):
 
         if not images:
             self.hint_label.setText(
-                "还没有人工修改过的图片。\n"
-                "在\"标注\"页面对AI标注结果进行增/删/改框后，"
-                "这里就会出现记录。"
+                "还没有对 AI 标注结果进行人工复标修正的记录。\n"
+                "在\"标注\"页面对经过 AI 标注的图片进行增/删/改框或改类别后，"
+                "这里就会展示 AI 原始结果(红框)与人工修正结果(绿框)的对比。"
             )
         else:
             self.image_list.setCurrentRow(0)
@@ -1129,8 +1136,8 @@ class AiLabelPage(QWidget):
         # 覆盖已有标注
         self.chk_overwrite = QCheckBox("覆盖图片已有标注")
         self.chk_overwrite.setToolTip(
-            "不勾选(推荐): 每次重标只替换上一轮AI生成的框，手动标注保留\n"
-            "勾选: 清空图片上所有标注(含手动标注)再写入"
+            "不勾选(推荐): 重标未锁定图片时，自动替换上一轮AI生成的框，手动标注保留；已锁定(🔒)图片整图跳过\n"
+            "勾选: 清空未锁定图片上的全部标注后再写入新结果；已锁定(🔒)图片依然整图跳过不受影响"
         )
         layout.addRow(self.chk_overwrite)
 
@@ -1166,9 +1173,17 @@ class AiLabelPage(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        header_row = QHBoxLayout()
         title = QLabel("运行日志")
         title.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        layout.addWidget(title)
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+
+        self.btn_clear_log = QPushButton("清除日志")
+        self.btn_clear_log.setToolTip("清空右侧运行日志显示内容")
+        self.btn_clear_log.clicked.connect(self.on_clear_log)
+        header_row.addWidget(self.btn_clear_log)
+        layout.addLayout(header_row)
 
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
@@ -1538,7 +1553,11 @@ class AiLabelPage(QWidget):
             return
         images = db.get_project_images(self.current_project_id)
         annotated = sum(1 for i in images if i.get('status') == 'annotated')
-        modified = sum(1 for i in images if i.get('modified'))
+        locked = sum(1 for i in images if i.get('locked'))
+        modified = sum(
+            1 for i in images
+            if i.get('modified') and i.get('ai_original') is not None
+        )
 
         # 断点信息
         bp_count = 0
@@ -1553,7 +1572,8 @@ class AiLabelPage(QWidget):
 
         self.project_stats_label.setText(
             f"图片: {len(images)} 张 (已标注 {annotated} 张)"
-            + (f" | 已人工修正 {modified} 张" if modified else "")
+            + (f" | 已锁定确认 {locked} 张" if locked else "")
+            + (f" | 复标纠错 {modified} 张" if modified else "")
             + (f" | AI断点: {bp_count} 张已完成" if bp_count else "")
         )
         self.btn_modified.setEnabled(True)
@@ -1740,6 +1760,13 @@ class AiLabelPage(QWidget):
             else:
                 self.append_log(f"负样本排除已由AI生成: {negative}")
         self.append_log("提示词已生成并填入类别表格，可人工微调")
+        # 提示词迭代更新后自动清除上一轮旧断点，方便直接点击“开始标注”重标所有未锁定图片
+        if self.current_project and self.current_project.get('storage_path'):
+            if clear_breakpoint(self.current_project['storage_path']):
+                self.append_log(
+                    "已自动清除上一轮AI断点：点击「开始标注」将对未锁定图片重新标定（已锁定图片自动跳过）"
+                )
+                self.refresh_project_stats()
 
     def on_prompt_error(self, msg):
         self.append_log(f"[错误] 生成提示词失败: {msg}")
@@ -1790,12 +1817,82 @@ class AiLabelPage(QWidget):
             QMessageBox.information(self, "提示", "项目中没有图片，请先导入")
             return
 
+        valid_images = [
+            i for i in images
+            if Path(i.get('storage_path') or '').suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        unlocked_images = [i for i in valid_images if not i.get('locked')]
+        locked_count = len(valid_images) - len(unlocked_images)
+
+        if valid_images and not unlocked_images:
+            QMessageBox.information(
+                self,
+                "提示",
+                f"当前项目的全部 {len(valid_images)} 张图片均已人工锁定（🔒），不参与 AI 重标。\n"
+                "如需让 AI 重新标定部分图片，请先在「02 图像标注」页面将其解锁。",
+            )
+            return
+
+        project_dir = self.current_project.get('storage_path', '.')
+        negative_text = self.le_negative.text().strip()
+        overwrite_checked = self.chk_overwrite.isChecked()
+        valid_examples = [
+            p for p in example_images
+            if Path(p).is_file() and Path(p).suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        current_sig = compute_ai_task_signature(prompt, negative_text, valid_examples)
+
+        bp_file = Path(project_dir) / 'ai_progress.json'
+        if bp_file.exists():
+            try:
+                bp_data = json.loads(bp_file.read_text(encoding='utf-8')) or {}
+            except Exception:
+                bp_data = {}
+            completed_set = set(bp_data.get('completed') or [])
+            saved_sig = bp_data.get('task_signature')
+            pending_unlocked = [
+                i for i in unlocked_images if i['filename'] not in completed_set
+            ]
+
+            if saved_sig and saved_sig != current_sig and completed_set:
+                clear_breakpoint(project_dir)
+                self.refresh_project_stats()
+                self.append_log(
+                    f"[自动重标] 检测到提示词/负样本或示例已更新，已自动重置旧断点，"
+                    f"即将重新标定 {len(unlocked_images)} 张未锁定图片"
+                    + (f"（自动跳过 {locked_count} 张已锁定图片）" if locked_count else "")
+                )
+            elif not pending_unlocked and unlocked_images:
+                if overwrite_checked:
+                    clear_breakpoint(project_dir)
+                    self.refresh_project_stats()
+                    self.append_log(
+                        f"[覆盖重标] 自动重置上一轮断点，即将重新标定 {len(unlocked_images)} 张未锁定图片"
+                        + (f"（自动跳过 {locked_count} 张已锁定图片）" if locked_count else "")
+                    )
+                else:
+                    reply = QMessageBox.question(
+                        self,
+                        "重新标定未锁定图片",
+                        f"未锁定的 {len(unlocked_images)} 张图片已在上一轮完成过 AI 标注"
+                        + (f"（另有 {locked_count} 张人工锁定图片受保护，不会重标）" if locked_count else "")
+                        + "。\n\n是否清除上一轮断点，让 AI 重新标定这 "
+                        f"{len(unlocked_images)} 张未锁定图片（会自动替换上一轮 AI 标注框）？",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                    clear_breakpoint(project_dir)
+                    self.refresh_project_stats()
+                    self.append_log("已重置上一轮断点，开始重新标定未锁定图片...")
+
         params = {
             "project_id": self.current_project_id,
             "images": images,
-            "project_dir": self.current_project.get('storage_path', '.'),
+            "project_dir": project_dir,
             "prompt": prompt,
-            "negative": self.le_negative.text().strip(),
+            "negative": negative_text,
             "example_images": example_images,
             "model": self.le_model.text().strip() or DEFAULT_MODEL,
             "api_key": api_key,
@@ -1807,7 +1904,7 @@ class AiLabelPage(QWidget):
             "zoom_refine": self.chk_zoom.isChecked(),
             "zoom_iters": self.sb_zoom_iters.value(),
             "limit": self.sb_limit.value(),
-            "overwrite": self.chk_overwrite.isChecked(),
+            "overwrite": overwrite_checked,
         }
 
         self.worker = AiAnnotateWorker(params)
@@ -1863,6 +1960,10 @@ class AiLabelPage(QWidget):
         QMessageBox.critical(self, "错误", f"标注失败:\n{msg}")
 
     # -------------------- 日志 --------------------
+
+    def on_clear_log(self):
+        """清空运行日志显示"""
+        self.log_edit.clear()
 
     def append_log(self, msg):
         self.log_edit.append(format_log_html(msg))

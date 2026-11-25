@@ -494,6 +494,29 @@ class Database:
                 (json.dumps(attrs, ensure_ascii=False), annotation_id)
             )
             return True
+
+    def clear_image_annotation_locks(self, image_id: int) -> int:
+        """清除指定图片下所有标注框的单框锁定标记(attributes.locked)，返回更新条数"""
+        updated = 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, attributes FROM annotations WHERE image_id = ?",
+                (image_id,)
+            )
+            for ann_id, raw_attrs in cursor.fetchall():
+                try:
+                    attrs = json.loads(raw_attrs or '{}')
+                except (TypeError, ValueError):
+                    attrs = {}
+                if 'locked' in attrs:
+                    attrs.pop('locked', None)
+                    cursor.execute(
+                        "UPDATE annotations SET attributes = ? WHERE id = ?",
+                        (json.dumps(attrs, ensure_ascii=False), ann_id)
+                    )
+                    updated += 1
+        return updated
     
     def update_image_status(self, image_id: int, status: str) -> bool:
         """更新图像状态"""
@@ -628,7 +651,8 @@ class Database:
         annotation_id: int,
         data: Dict = None,
         class_id: int = None,
-        class_name: str = None
+        class_name: str = None,
+        attributes: Dict = None,
     ) -> bool:
         """
         更新标注
@@ -638,6 +662,7 @@ class Database:
             data: 标注数据
             class_id: 类别ID
             class_name: 类别名称
+            attributes: 额外属性字典（可选）
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -656,6 +681,10 @@ class Database:
             if class_name is not None:
                 updates.append("class_name = ?")
                 values.append(class_name)
+
+            if attributes is not None:
+                updates.append("attributes = ?")
+                values.append(json.dumps(attributes, ensure_ascii=False))
             
             # 总是更新updated_at时间戳
             updates.append("updated_at = ?")
@@ -671,6 +700,19 @@ class Database:
                 values
             )
             return cursor.rowcount > 0
+
+    def get_annotation(self, annotation_id: int) -> Optional[Dict]:
+        """获取单条标注记录"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM annotations WHERE id = ?", (annotation_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            ann = dict(row)
+            ann['data'] = json.loads(ann['data'] or '{}')
+            ann['attributes'] = json.loads(ann['attributes'] or '{}')
+            return ann
     
     def get_image_annotations(self, image_id: int) -> List[Dict]:
         """获取图像的所有标注"""
